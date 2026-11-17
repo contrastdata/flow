@@ -1078,6 +1078,13 @@ impl Policy {
         });
         let mut budget_blocked = false;
         for seed in &eligible {
+            // Hard L0 debt sorts L0 seeds first, and only an L0 rewrite lowers
+            // it. When every L0 group exceeds the delete input budget, report
+            // that, so a bounded dependency repair can localize their deletes,
+            // instead of a group of other files that leaves publication paused.
+            if hard_l0_debt && budget_blocked && seed.level != Level::L0 {
+                break;
+            }
             let output_level = if seed.level == Level::L0 {
                 Level::L1
             } else {

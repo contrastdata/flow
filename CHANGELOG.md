@@ -476,6 +476,11 @@ From earlier development builds of `main`:
 
 ### Fixed
 
+- Under hard L0 debt, compaction no longer spends paused publication on other
+  files when every L0 group exceeds the delete input budget. Planning reports
+  the budget instead, so a bounded dependency repair can unblock the L0
+  files. In an update-heavy benchmark, a 657k-row small-file merge (4.3 s) ran
+  this way while publication stayed paused on L0 age.
 - A table whose sort order was set by another engine (`ALTER TABLE … WRITE
   ORDERED BY`) no longer fails data compaction. The build returned an
   unclassified error, which stopped the daemon each time compaction became

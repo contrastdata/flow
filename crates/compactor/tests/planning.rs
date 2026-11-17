@@ -1300,3 +1300,53 @@ fn per_target_pools_l0_and_small_targets_between_full_size_files() {
         TargetRanges::default()
     );
 }
+
+#[test]
+fn hard_l0_debt_blocked_by_its_deletes_asks_for_repair_not_other_files() {
+    // Publication is paused on L0 age. The old L0 files share a delete file
+    // over the row budget, while six small stable files form an unrelated
+    // small-file group that would leave publication paused.
+    let policy = Policy::default();
+    let mut files = (0..2)
+        .map(|id| {
+            let mut l0 = file(id, 1 << 20);
+            l0.age_ms = policy.oldest_l0_hard_ms;
+            l0
+        })
+        .collect::<Vec<_>>();
+    files.extend((2..8).map(|id| {
+        let mut stable = file(id, 4 << 20);
+        stable.level = Level::L2;
+        stable.age_ms = 60_000;
+        stable
+    }));
+    let debt = policy.debt(&files).unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Pause);
+    assert_eq!(policy.pressure_reasons(&debt), vec!["oldest_l0"]);
+    let shared = DeleteDependency {
+        id: FileId("shared-delete".into()),
+        size_bytes: 1 << 20,
+        row_count: policy.max_delete_input_rows + 1,
+        targets: files[..2].iter().map(|file| file.id.clone()).collect(),
+    };
+    assert_eq!(
+        policy.plan(1, 0, &files, std::slice::from_ref(&shared)),
+        Err(Error::DependencyBudget)
+    );
+    // Within the budget, the same debt selects the L0 files.
+    let fits = DeleteDependency {
+        row_count: policy.max_delete_input_rows,
+        ..shared.clone()
+    };
+    let plan = policy.plan(1, 0, &files, &[fits]).unwrap().unwrap();
+    assert_eq!(
+        plan.input_files,
+        files[..2].iter().map(|file| file.id.clone()).collect()
+    );
+    // Without hard L0 debt, other work still runs beside a blocked L0 group.
+    for l0 in &mut files[..2] {
+        l0.age_ms = policy.oldest_l0_soft_ms;
+    }
+    let plan = policy.plan(1, 0, &files, &[shared]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::SmallFiles);
+}

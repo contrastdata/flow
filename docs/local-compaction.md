@@ -418,6 +418,12 @@ Position-delete files carry exact full-path bounds, and a data rewrite emits at
 most eight ordered residual ranges. This avoids charging a single broad residual
 to every older data file when narrower metadata can exclude it.
 
+Under hard L0 debt, L0 groups come first and only they lower the pause. When
+every L0 group exceeds the delete budget, planning reports that instead of
+selecting other files, such as a small-file group, that would spend the paused
+publication without lowering its debt. An update-heavy benchmark spent 4.3 s of
+a 10.8 s pause merging 657k rows of unrelated small files this way.
+
 When no useful data group fits, a repair pass reads one individually admissible
 shared delete file and counts its effective positions using disk-backed staging.
 It can isolate one blocked target into at most three ordered ranges. Publication
