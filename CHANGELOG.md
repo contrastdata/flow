@@ -418,6 +418,18 @@ From earlier development builds of `main`:
   alongside it. CDC publication files keep 8,192 rows, compaction keeps
   8,192-row batches, and position reads use the offset index to skip pages.
   Set the limit to 8192 for the previous layout.
+- Parquet writers encode the top-level fields of a large batch on several
+  threads when its work is spread across fields and encode threads are free,
+  writing byte-identical files. A batch fans out only with at least 256 KiB
+  of Arrow data and an achievable speedup of 1.5, so narrow tables dominated
+  by one column, small batches and a host whose encode threads are busy stay
+  sequential. `limits.parquet_encode_threads` sets the process-wide budget
+  (default half the cores, at most four; 0 or 1 disables) and
+  `flow_parquet_parallel_batches_total` counts batches that fanned out. On a
+  64-column table, CDC Parquet writes took 12% less time and compaction
+  builds 10–20% less per row; a 3-column table never fanned out. See
+  [parallel encoding](docs/benchmarks/parallel-encode.md). The benchmark
+  harness gains `--extra-columns` for wider tables.
 - Data and delete files record page statistics, so each carries a Parquet
   column index (per-page bounds) as well as the offset index. Readers that use
   it, such as Trino, Spark and DataFusion, can skip pages inside a row group.
