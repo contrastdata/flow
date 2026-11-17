@@ -281,6 +281,12 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- With `delete_layout = "per_target"`, a data file outside L0 holding at least
+  a quarter of a smaller table's bytes outside L0 is full-size, down to
+  16 MiB, so it keeps its own delete files without lowering
+  `target_delete_min_file_bytes`. Tables with at least four times that
+  threshold outside L0 are unchanged; see
+  [per-target delete layout](docs/local-compaction.md#per-target-delete-layout).
 - While a table's background build runs, a second build may merge the L0
   files it did not select once they alone reach a soft L0 limit, so CDC
   output no longer reaches the hard L0 limit and pauses publication behind a

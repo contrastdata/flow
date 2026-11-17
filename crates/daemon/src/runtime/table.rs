@@ -1245,14 +1245,15 @@ impl TableWork {
         })
     }
 
-    /// The configured compaction policy as it applies to this table's format.
+    /// The configured compaction policy as it applies to this table's format
+    /// and size.
     fn delete_policy(
         &self,
         inventory: &flow_coordinator::Inventory,
     ) -> std::borrow::Cow<'_, flow_compactor::Policy> {
         self.config
             .compaction
-            .for_format_version(inventory.format_version)
+            .for_table(inventory.format_version, &inventory.files)
     }
 
     fn prefers_delete_rewrite(&self, inventory: &flow_coordinator::Inventory) -> bool {

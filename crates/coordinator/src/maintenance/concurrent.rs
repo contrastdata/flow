@@ -308,7 +308,7 @@ impl TableMaintenance {
         let inventory = self.inventory(&table, schema.table_id).await?;
         let mut policy = self
             .policy
-            .for_format_version(table.metadata().format_version());
+            .for_table(table.metadata().format_version(), &inventory.files);
         if scope.l0_only && policy.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
         {
             policy.to_mut().data_rewrite_scope = flow_compactor::DataRewriteScope::L0Only;

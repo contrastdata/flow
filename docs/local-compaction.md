@@ -306,7 +306,13 @@ With `[compaction] delete_layout = "per_target"` (default `"shared"`), format
 v2 tables keep rewritten position deletes on each full-size data file in one
 file per data file, whose equal lower and upper `file_path` bounds name it.
 A data file is full-size outside L0 at `target_delete_min_file_bytes`
-(128 MiB, like `l1_target_bytes`) or more. Positions on L0 and smaller files
+(128 MiB, like `l1_target_bytes`) or more. In a table with less than four times
+that outside L0, a file holding at least a quarter of those bytes is also
+full-size, down to 16 MiB: a small table dominated by one base file keeps that
+file's deletes apart from the pooled L0 ranges every rewrite reads. At most
+four files qualify this way, and the threshold moves with the table, so a file
+that falls below it is a small file whose single-target files a data rewrite
+pays, as below. Positions on L0 and smaller files
 are pooled into shared range files, as with the shared layout, ending before
 any full-size file between their targets by path. Those files are rewritten
 soon, and that rewrite or the next consolidation consumes the range, whereas

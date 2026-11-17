@@ -1350,3 +1350,65 @@ fn hard_l0_debt_blocked_by_its_deletes_asks_for_repair_not_other_files() {
     let plan = policy.plan(1, 0, &files, &[shared]).unwrap().unwrap();
     assert_eq!(plan.reason, PlanReason::SmallFiles);
 }
+
+#[test]
+fn per_target_full_size_threshold_scales_down_to_a_quarter_of_a_small_table() {
+    use flow_compactor::{FULL_SIZE_FLOOR_BYTES, FULL_SIZE_TABLE_SHARE};
+    use iceberg::spec::FormatVersion;
+    let per_target = Policy {
+        delete_layout: DeleteLayout::PerTarget,
+        ..Default::default()
+    };
+    let stable = |id, bytes| {
+        let mut file = file(id, bytes);
+        file.level = Level::L2;
+        file
+    };
+    // A 43 MiB base file, two small files and L0 output, which is not counted.
+    let mut files = vec![
+        stable(0, 43 << 20),
+        stable(1, 4 << 20),
+        stable(2, 3 << 20),
+        file(3, 64 << 20),
+    ];
+    let scaled = per_target.for_table(FormatVersion::V2, &files);
+    assert_eq!(scaled.target_delete_min_file_bytes, FULL_SIZE_FLOOR_BYTES);
+    assert!(scaled.full_size_target(&files[0]));
+    assert!(!scaled.full_size_target(&files[1]) && !scaled.full_size_target(&files[3]));
+    // Above the floor the threshold is a share of the bytes outside L0.
+    files.push(stable(4, 150 << 20));
+    let scaled = per_target.for_table(FormatVersion::V2, &files);
+    assert_eq!(
+        scaled.target_delete_min_file_bytes,
+        (200 << 20) / FULL_SIZE_TABLE_SHARE
+    );
+    assert!(scaled.full_size_target(&files[4]) && !scaled.full_size_target(&files[0]));
+    // A large table keeps the configured threshold, as do shared and v3 layouts.
+    files.push(stable(5, 1 << 30));
+    assert_eq!(
+        per_target
+            .for_table(FormatVersion::V2, &files)
+            .target_delete_min_file_bytes,
+        per_target.target_delete_min_file_bytes
+    );
+    files.truncate(3);
+    for policy in [
+        Policy::default().for_table(FormatVersion::V2, &files),
+        per_target.for_table(FormatVersion::V3, &files),
+    ] {
+        assert_eq!(
+            policy.target_delete_min_file_bytes,
+            per_target.target_delete_min_file_bytes
+        );
+    }
+    // A configured threshold below the floor is never raised.
+    let low = Policy {
+        target_delete_min_file_bytes: 1 << 20,
+        ..per_target.clone()
+    };
+    assert_eq!(
+        low.for_table(FormatVersion::V2, &files)
+            .target_delete_min_file_bytes,
+        1 << 20
+    );
+}

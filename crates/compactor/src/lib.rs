@@ -262,7 +262,8 @@ pub struct Policy {
     pub target_delete_files_max: usize,
     /// With [`DeleteLayout::PerTarget`], data files outside L0 at least this
     /// large are full-size: they keep one delete file each. Positions on
-    /// smaller and L0 files share range files; see [`TargetRanges`].
+    /// smaller and L0 files share range files; see [`TargetRanges`]. In a
+    /// smaller table, [`Policy::for_table`] lowers it to a share of the table.
     pub target_delete_min_file_bytes: u64,
     /// Periodic maintenance materializes a table's remaps while more retired
     /// files than this keep one.
@@ -284,6 +285,14 @@ pub struct Policy {
 }
 /// Well below the state store's translation hop limit.
 const MAX_REMAP_DEPTH: u64 = 1024;
+
+/// With [`DeleteLayout::PerTarget`], a file outside L0 holding at least this
+/// fraction (1/n) of a table's bytes outside L0 is full-size. See
+/// [`Policy::for_table`].
+pub const FULL_SIZE_TABLE_SHARE: u64 = 4;
+/// The smallest full-size threshold [`Policy::for_table`] derives. Smaller
+/// files are cheap to rewrite, so their deletes stay pooled.
+pub const FULL_SIZE_FLOOR_BYTES: u64 = 16 << 20;
 
 impl Default for Policy {
     fn default() -> Self {
@@ -676,6 +685,35 @@ impl Policy {
         } else {
             Cow::Borrowed(self)
         }
+    }
+
+    /// The policy for a table of `version` whose live data files are `files`:
+    /// [`Self::for_format_version`], and with [`DeleteLayout::PerTarget`] a
+    /// full-size threshold scaled to the table. A file outside L0 holding at
+    /// least 1/[`FULL_SIZE_TABLE_SHARE`] of the bytes outside L0 is full-size,
+    /// down to [`FULL_SIZE_FLOOR_BYTES`], so a small table dominated by one
+    /// file keeps that file's deletes apart from the L0 ranges every rewrite
+    /// reads. At most that many files qualify this way, and tables of at least
+    /// [`FULL_SIZE_TABLE_SHARE`] times `target_delete_min_file_bytes` are
+    /// unchanged.
+    pub fn for_table(&self, version: FormatVersion, files: &[FileCandidate]) -> Cow<'_, Self> {
+        let policy = self.for_format_version(version);
+        if policy.delete_layout != DeleteLayout::PerTarget {
+            return policy;
+        }
+        let stable = files
+            .iter()
+            .filter(|file| file.level != Level::L0)
+            .fold(0u64, |bytes, file| bytes.saturating_add(file.size_bytes));
+        let threshold = (stable / FULL_SIZE_TABLE_SHARE)
+            .max(FULL_SIZE_FLOOR_BYTES)
+            .min(policy.target_delete_min_file_bytes);
+        if threshold == policy.target_delete_min_file_bytes {
+            return policy;
+        }
+        let mut scaled = policy.into_owned();
+        scaled.target_delete_min_file_bytes = threshold;
+        Cow::Owned(scaled)
     }
 
     /// Whether a delete-only consolidation should pay this debt before any
