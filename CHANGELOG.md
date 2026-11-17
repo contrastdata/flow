@@ -341,6 +341,16 @@ From earlier development builds of `main`:
 - UPDATE/DELETE keys are encoded without copying the table schema, and CDC and
   initial COPY rows no longer revalidate the relation's types row by row.
 - The four concurrent initial COPY workers run on separate runtime threads.
+- Initial COPY reads a large table as 1 MiB `ctid` page ranges on several
+  connections under the same snapshot, instead of one stream per table. The
+  existing four concurrent COPYs are shared: one table uses up to four
+  streams, and four or more tables keep one each, so the source never serves
+  more COPYs than before. Ranges are appended to the staging journal in page
+  order, preserving the row order a single stream would produce; interleaving
+  them doubled the initial collapse of a key-ordered table in testing. An extra
+  connection that cannot be opened only lowers parallelism. For one 2M-row
+  table, the COPY window fell 38% (1.91 s to 1.18 s) and the whole bootstrap
+  9% (12.6 s to 11.5 s), medians of 6 release runs per side.
 - A busy table's next epoch is folded from the journal while the current
   epoch commits and applies, so its collapse only binds the fold against the
   index. The fold stays within `limits.collapse_memory_bytes`, is used only if
