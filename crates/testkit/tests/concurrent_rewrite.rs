@@ -1767,3 +1767,154 @@ async fn strict_lazy_compaction_commits_a_remap_instead_of_row_deltas() {
     assert!(!f.index.has_remaps(&table_id).unwrap());
     assert_index_exact(&f, &f.head, "strict-audit-5").await;
 }
+
+/// A table runs a second build beside the first over files the first did not
+/// select, as the daemon's side lane does for L0. The side build consumes
+/// shared delete files that also cover the main build's input and writes
+/// their residuals; the main build still catches up across that rewrite and
+/// late deletes on both sides, and commits. Both remap modes keep rows and the
+/// index exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disjoint_side_build_and_main_build_both_commit_across_each_other() {
+    for lazy in [false, true] {
+        let mut f = Fixture::new().await;
+        let maintenance = TableMaintenance::new(
+            f.index.clone(),
+            f.catalog.clone(),
+            Policy {
+                l0_soft_files: 2,
+                l0_hard_files: 64,
+                deleted_rows_percent: 1,
+                min_file_age_ms: 0,
+                lazy_index_remap: lazy,
+                ..Default::default()
+            },
+            WriterConfig::default(),
+        )
+        .unwrap();
+        cdc(&mut f, 90, vec![(16, Change::Insert(row(16)))]).await;
+        let l0 = flow_model::FileId(f.locations[6].data_file_id.0.clone());
+        let main = maintenance
+            .start_compaction_scoped(
+                &f.head,
+                &f.schema,
+                f.scratch("main-build"),
+                &flow_coordinator::BuildScope {
+                    exclude: std::sync::Arc::new([l0.clone()].into()),
+                    l0_only: false,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let main_inputs = main.input_files().clone();
+        assert_eq!(
+            *main_inputs,
+            [flow_model::FileId(f.locations[0].data_file_id.0.clone())].into()
+        );
+        cdc(
+            &mut f,
+            100,
+            vec![
+                (17, Change::Insert(row(17))),
+                (13, Change::Update(updated(13))),
+                (4, Change::Delete),
+            ],
+        )
+        .await;
+        let side = maintenance
+            .start_compaction_scoped(
+                &f.head,
+                &f.schema,
+                f.scratch("side-build"),
+                &flow_coordinator::BuildScope {
+                    exclude: main_inputs.clone(),
+                    l0_only: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let side_inputs = side.input_files().clone();
+        assert!(side_inputs.contains(&l0) && side_inputs.is_disjoint(&main_inputs));
+        assert_eq!(
+            f.index
+                .source_transactions_after(b"active-build/", None)
+                .count(),
+            2
+        );
+        let shared_before = SnapshotView::current(&f.head).await.unwrap();
+        cdc(
+            &mut f,
+            110,
+            vec![(5, Change::Delete), (10, Change::Update(updated(10)))],
+        )
+        .await;
+        let side = side.wait().await.unwrap();
+        let head = f.head.clone();
+        maintenance
+            .finish_compaction(&head, &f.schema, side)
+            .await
+            .unwrap()
+            .expect("side build commits");
+        f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+        // The side rewrite replaced a delete file that covers the main input.
+        let after_side = SnapshotView::current(&f.head).await.unwrap();
+        assert!(shared_before.live_files.values().any(|entry| {
+            entry.content_type() == DataContentType::PositionDeletes
+                && !after_side.live_files.contains_key(entry.file_path())
+        }));
+        assert_index_exact(&f, &f.head, &format!("side-{lazy}")).await;
+        cdc(&mut f, 120, vec![(3, Change::Delete)]).await;
+        let main = main.wait().await.unwrap();
+        let head = f.head.clone();
+        maintenance
+            .finish_compaction(&head, &f.schema, main)
+            .await
+            .unwrap()
+            .expect("the main build commits across the side rewrite");
+        f.head = f.catalog.load_table(head.identifier()).await.unwrap();
+        let expected = sorted(vec![
+            updated(10),
+            updated(13),
+            row(14),
+            row(15),
+            row(16),
+            row(17),
+        ]);
+        assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), expected);
+        let live = SnapshotView::current(&f.head).await.unwrap();
+        assert!(
+            main_inputs
+                .iter()
+                .chain(side_inputs.iter())
+                .all(|file| !live.live_files.contains_key(&file.0))
+        );
+        assert!(f.index.pending_operations().unwrap().is_empty());
+        assert!(
+            f.index
+                .source_transactions_after(b"active-build/", None)
+                .next()
+                .is_none()
+        );
+        assert_index_exact(&f, &f.head, &format!("main-{lazy}")).await;
+        // CDC on rows both rewrites moved.
+        cdc(
+            &mut f,
+            130,
+            vec![(14, Change::Delete), (16, Change::Update(updated(16)))],
+        )
+        .await;
+        assert_eq!(
+            sorted(scan(&f.head, &f.schema).await.unwrap()),
+            sorted(vec![
+                updated(10),
+                updated(13),
+                row(15),
+                updated(16),
+                row(17)
+            ])
+        );
+        assert_index_exact(&f, &f.head, &format!("after-{lazy}")).await;
+    }
+}

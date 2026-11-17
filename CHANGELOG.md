@@ -17,6 +17,11 @@ This will be the initial public release, `0.1.0`.
 
 From earlier development builds of `main`:
 
+- Background build ownership records are keyed by table and operation
+  (`active-build/v2/`); startup still discards the earlier per-table records.
+  An earlier build cannot open a state directory that retains a v2 record,
+  such as after a shutdown during a build; it stops with an unsupported
+  record version.
 - The row index moves to format 4, which names data files by ordinal. The
   first start rebuilds it from the control store and Iceberg, skipping
   row-index checkpoints of the older format; the journal, control store,
@@ -276,6 +281,14 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- While a table's background build runs, a second build may merge the L0
+  files it did not select once they alone reach a soft L0 limit, so CDC
+  output no longer reaches the hard L0 limit and pauses publication behind a
+  long rewrite. Either build catches up across the other's commit; a table
+  runs one preparation and activation at a time, and both share the existing
+  build budget. `compaction_side_build_probe_admitted` and
+  `compaction_build_started` (`l0_only`, `excluded_files`) report them. See
+  [side builds](docs/local-compaction.md#side-builds-beside-a-long-rewrite).
 - Compaction catch-up keeps a consolidated head set that fits the compact
   path in memory when the build has a lazy remap: one pass proves that the
   set contains every position the remap leaves uncovered (the build's original

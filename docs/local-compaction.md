@@ -83,7 +83,10 @@ work retain their existing paths.
 The daemon admits up to two local builds within the configured table worker
 budget, leaving at least one worker for table actors and keeping each reservation
 through finalization. With only one table worker, it uses the strict path.
-Library callers must serialize one build per table.
+Library callers register builds on the serialized table actor. A table holds at
+most two BUILD records, and a second build must not select the first's inputs
+(`BuildScope`).
+
 A completed build receives a short table boundary for background handoff, then a
 prepared candidate receives the next boundary for activation. Prepared work is
 preferred over a new CDC epoch; build handoff is preferred next so sustained CDC
@@ -94,6 +97,28 @@ hard debt. The build wait requests cancellation after 30 seconds and still joins
 the actual worker before releasing ownership. Catch-up accepts at most 256
 intervening snapshots and applies the configured delete-input file, byte and row
 limits before staging. The Parquet read/write admission limits also apply.
+
+### Side builds beside a long rewrite
+
+A table's main lane runs any background build. Rewriting a large table can take
+several seconds, while CDC adds an L0 file per epoch; if those files reached
+the hard L0 limit, publication would pause until the build finished and a
+synchronous rewrite cleared them. So while a main build's worker runs, the
+table's side lane may capture a second build over only the L0 files the main
+build did not select, once those alone reach a soft L0 limit. It is admitted
+like a probe when the table's maintenance is due, or at once if hard pressure
+is already waiting for the main build. Both lanes share the build budget, and
+no main build starts while a side build holds its lane.
+
+Either build may activate first. The other's catch-up then sees an
+intervening rewrite of files it did not select: its own inputs are unchanged,
+and any position-delete file the rewrite replaced goes through the same
+retention proof as a delete consolidation. A table runs one preparation and
+activation at a time; a completed build of the other lane waits for that
+pipeline. BUILD records are keyed by table and operation
+(`active-build/v2/<table-uuid>/<operation>`). Startup still discards the
+earlier per-table records; a release before side builds cannot open a state
+directory that retains a v2 record and reports an unsupported record version.
 
 After one second of deferral, an eligible soft data-build probe may precede
 another ready CDC epoch. This does not guarantee admission of soft delete

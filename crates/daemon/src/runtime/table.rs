@@ -5,9 +5,9 @@ use super::{BUILD_MAX_AGE, OPTIONAL_MAINTENANCE_DELAY, blocked::publication_erro
 use crate::config::Config;
 use anyhow::{Context, Result, bail, ensure};
 use flow_coordinator::{
-    CollapseLimits, DeleteRepairCursor, Epoch, PreparedCompaction, ReadyCompaction, ReplanRequired,
-    RunningCompaction, RunningCompactionPreparation, TableMaintenance, TablePublisher,
-    collapse_epoch_prefolded,
+    BuildScope, CollapseLimits, DeleteRepairCursor, Epoch, PreparedCompaction, ReadyCompaction,
+    ReplanRequired, RunningCompaction, RunningCompactionPreparation, TableMaintenance,
+    TablePublisher, collapse_epoch_prefolded,
 };
 use flow_ingress_journal::JournalReader;
 use flow_model::{OperationId, SourceId, SourceTransaction, TableId, TableSchema};
@@ -149,6 +149,30 @@ pub(super) enum BuildAdmission {
     Wait,
     Start,
     Probe,
+    /// Capture an L0 build beside the table's running build, over files it
+    /// did not select. See [`BuildLane::Side`].
+    Side,
+}
+
+/// A table holds at most one reservation in each lane. The main lane runs
+/// any background build. The side lane runs only while a main build's worker
+/// does: it merges the L0 files that build did not select, so newer CDC
+/// output cannot reach the hard L0 limit and pause publication behind a long
+/// rewrite. One preparation and activation run per table at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum BuildLane {
+    #[default]
+    Main,
+    Side,
+}
+
+impl BuildLane {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Side => "side",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -156,6 +180,8 @@ pub(super) struct WorkOptions {
     pub(super) periodic_maintenance: bool,
     pub(super) build_active: bool,
     pub(super) build_admission: BuildAdmission,
+    /// The lane of the build this run reserves or finalizes, if any.
+    pub(super) lane: BuildLane,
     pub(super) actor_acquired_at: Instant,
 }
 
@@ -276,6 +302,7 @@ pub(super) struct TableCompletion {
     pub(super) outcome: TableOutcome,
     pub(super) elapsed: Duration,
     pub(super) reserved_build: bool,
+    pub(super) lane: BuildLane,
     pub(super) finalization_lane: Option<FinalizationLane>,
     pub(super) periodic_maintenance: bool,
 }
@@ -393,6 +420,7 @@ impl TableWork {
         &self,
         table: &Table,
         schema: &TableSchema,
+        scope: &BuildScope,
     ) -> Result<Option<StartedBuild>> {
         let path = self
             .config
@@ -410,7 +438,7 @@ impl TableWork {
         let started = Instant::now();
         match self
             .maintenance
-            .start_compaction(table, schema, scratch)
+            .start_compaction_scoped(table, schema, scratch, scope)
             .await
         {
             Ok(Some(running)) => Ok(Some(StartedBuild {
@@ -488,7 +516,8 @@ impl TableWork {
         repair_cursor: &mut DeleteRepairCursor,
     ) -> Result<Option<StartedBuild>> {
         let result = if background {
-            self.start_build(table, schema).await
+            self.start_build(table, schema, &BuildScope::default())
+                .await
         } else {
             self.compact(table, schema, CompactionKind::Data)
                 .await
@@ -523,6 +552,7 @@ impl TableWork {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         self,
         schema: TableSchema,
@@ -531,6 +561,7 @@ impl TableWork {
         mut candidate: Option<CompactionCandidate>,
         finalization_lane: Option<FinalizationLane>,
         prefold: PrefoldLink,
+        side_scope: Option<BuildScope>,
     ) -> Result<TableCompletion> {
         let started = Instant::now();
         let mut repair_cursor = DeleteRepairCursor::default();
@@ -538,7 +569,7 @@ impl TableWork {
         let reserved_build = candidate.is_some()
             || matches!(
                 options.build_admission,
-                BuildAdmission::Start | BuildAdmission::Probe
+                BuildAdmission::Start | BuildAdmission::Probe | BuildAdmission::Side
             );
         let candidate_stage = candidate.as_ref().map(|candidate| {
             if candidate.is_prepared() {
@@ -581,6 +612,7 @@ impl TableWork {
                     &mut candidate,
                     &mut repair_cursor,
                     prefold,
+                    side_scope,
                 )
                 .await
         }
@@ -600,7 +632,10 @@ impl TableWork {
                 }
             }
             Err(error)
-                if options.build_admission == BuildAdmission::Probe && retry_table_work(&error) =>
+                if matches!(
+                    options.build_admission,
+                    BuildAdmission::Probe | BuildAdmission::Side
+                ) && retry_table_work(&error) =>
             {
                 TableOutcome::ProbeComplete
             }
@@ -667,6 +702,7 @@ impl TableWork {
             outcome,
             elapsed: started.elapsed(),
             reserved_build,
+            lane: options.lane,
             finalization_lane,
             periodic_maintenance: options.periodic_maintenance,
         })
@@ -802,6 +838,7 @@ impl TableWork {
         candidate: &mut Option<CompactionCandidate>,
         repair_cursor: &mut DeleteRepairCursor,
         prefold: PrefoldLink,
+        side_scope: Option<BuildScope>,
     ) -> Result<TableOutcome> {
         let id = schema.table_id;
         if options.build_admission == BuildAdmission::Probe {
@@ -810,6 +847,14 @@ impl TableWork {
                 "build probe contains publication work"
             );
             return self.probe_build(table, schema).await;
+        }
+        if options.build_admission == BuildAdmission::Side {
+            ensure!(
+                transactions.is_empty() && candidate.is_none(),
+                "side build probe contains publication work"
+            );
+            let scope = side_scope.context("side build probe without a scope")?;
+            return self.probe_side_build(table, schema, scope).await;
         }
         let recovery = self.recover_pending(&table, id).await?;
         if recovery == PendingRecovery::Ingest {
@@ -1146,7 +1191,55 @@ impl TableWork {
             }
         }
         self.choose_maintenance(id, &inventory, "background_build", "probe");
-        Ok(match self.start_build(&current, &schema).await? {
+        Ok(
+            match self
+                .start_build(&current, &schema, &BuildScope::default())
+                .await?
+            {
+                Some(build) => TableOutcome::Build(Box::new(build)),
+                None => TableOutcome::ProbeComplete,
+            },
+        )
+    }
+
+    /// Capture an L0 build beside the table's running build when the L0 files
+    /// that build did not select reach a soft limit. Like a probe, it changes
+    /// nothing else; recovery and synchronous maintenance stay with CDC.
+    async fn probe_side_build(
+        &self,
+        current: Table,
+        schema: TableSchema,
+        scope: BuildScope,
+    ) -> Result<TableOutcome> {
+        if !self.compaction {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let id = schema.table_id;
+        let indexed = self.store.table_state(&id)?;
+        if indexed.pending_operation.is_some() {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let source = SourceId(self.config.source.id.clone());
+        let schema = crate::schema::latest_schema(&self.store, &source, id)?.unwrap_or(schema);
+        if indexed.snapshot_id != current.metadata().current_snapshot_id()
+            || indexed.schema_version != schema.version
+            || !flow_coordinator::same_iceberg_schema(
+                current.metadata().current_schema(),
+                &flow_materializer::iceberg_schema(&schema)?,
+            )
+        {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        let inventory = self.maintenance.inventory(&current, id).await?;
+        crate::observation::table_inventory(id, &inventory);
+        let policy = self.delete_policy(&inventory);
+        if policy.data_rewrite_scope == flow_compactor::DataRewriteScope::Disabled
+            || !policy.l0_debt_outside(&inventory.files, &scope.exclude)
+        {
+            return Ok(TableOutcome::ProbeComplete);
+        }
+        self.choose_maintenance(id, &inventory, "side_build", "build_active");
+        Ok(match self.start_build(&current, &schema, &scope).await? {
             Some(build) => TableOutcome::Build(Box::new(build)),
             None => TableOutcome::ProbeComplete,
         })
@@ -2049,11 +2142,13 @@ mod publication_retry_tests {
                     periodic_maintenance: false,
                     build_active: false,
                     build_admission: BuildAdmission::Wait,
+                    lane: BuildLane::Main,
                     actor_acquired_at: Instant::now(),
                 },
                 None,
                 None,
                 PrefoldLink::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2356,6 +2451,7 @@ mod metadata_maintenance_tests {
             periodic_maintenance: false,
             build_active: false,
             build_admission: BuildAdmission::Wait,
+            lane: BuildLane::Main,
             actor_acquired_at: Instant::now(),
         }
     }
@@ -2439,6 +2535,7 @@ mod metadata_maintenance_tests {
                 None,
                 None,
                 PrefoldLink::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2481,6 +2578,7 @@ mod metadata_maintenance_tests {
                 None,
                 None,
                 PrefoldLink::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2509,6 +2607,7 @@ mod metadata_maintenance_tests {
                 None,
                 None,
                 PrefoldLink::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2575,6 +2674,7 @@ mod metadata_maintenance_tests {
                 None,
                 None,
                 PrefoldLink::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2974,6 +3074,7 @@ mod metadata_maintenance_tests {
                     None,
                     None,
                     PrefoldLink::default(),
+                    None,
                 )
                 .await
                 .unwrap();

@@ -7,8 +7,8 @@ mod builds;
 mod concurrent;
 pub use builds::{BuildRegistration, active_build_protection, discard_abandoned_builds};
 pub use concurrent::{
-    PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
-    RunningCompaction, RunningCompactionPreparation,
+    BuildScope, PreparationWait, PreparedCompaction, ReadyCompaction,
+    RetiringCompactionPreparation, RunningCompaction, RunningCompactionPreparation,
 };
 mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};

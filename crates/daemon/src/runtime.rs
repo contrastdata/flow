@@ -12,7 +12,7 @@ use self::{
     pending::{EPOCH_MAX_BYTES, EPOCH_MUTATION_TRIGGER, PendingWork, schedule_transactions},
     prefold::Prefolds,
     table::{
-        BuildAdmission, CompactionCandidate, CompletedBuild, CompletedPreparation,
+        BuildAdmission, BuildLane, CompactionCandidate, CompletedBuild, CompletedPreparation,
         FinalizationLane, PrefoldLink, StartedBuild, StartedPreparation, TableCompletion,
         TableOutcome, TableWork, WorkOptions, retry_table_work,
     },
@@ -26,15 +26,15 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use flow_coordinator::{
-    PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler, SourceLedger,
-    TableMaintenance, TablePublisher,
+    BuildScope, PreparationWait, Priority, ReadyCompaction, ReplanRequired, Scheduler,
+    SourceLedger, TableMaintenance, TablePublisher,
 };
-use flow_model::{OperationId, PgLsn, SourceId, TableId, TableSchema};
+use flow_model::{FileId, OperationId, PgLsn, SourceId, TableId, TableSchema};
 use flow_pg_source::Acknowledgement;
 use flow_state_store::{ControlStore, OperationKind, StateStore};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -418,30 +418,77 @@ fn settle_resync_table(
     Ok(true)
 }
 
+/// A finished candidate taken from a table that will never publish again.
+enum Released<B, P> {
+    Build(B),
+    Preparation(P),
+}
+
 /// A table that will never publish again cannot activate compaction, and its
 /// finished candidates would hold build slots forever. Take them for
-/// retirement and release the table's build state. A build or preparation
+/// retirement and release each lane's build state. A build or preparation
 /// still running completes into these maps and is released on a later tick.
+#[allow(clippy::too_many_arguments)]
 fn release_blocked_candidates<B, P>(
     table: TableId,
-    ready_builds: &mut BTreeMap<TableId, B>,
+    ready_builds: &mut BTreeMap<(TableId, BuildLane), B>,
     ready_preparations: &mut BTreeMap<TableId, P>,
+    preparing: &mut HashMap<TableId, BuildLane>,
     build_active: &mut HashSet<TableId>,
+    side_active: &mut HashSet<TableId>,
     activation_pending: &mut HashSet<TableId>,
     waiting_for_build: &mut HashSet<TableId>,
-    retiring_builds: &mut HashSet<TableId>,
-) -> (Option<B>, Option<P>) {
-    let released = (
-        ready_builds.remove(&table),
-        ready_preparations.remove(&table),
-    );
-    if released.0.is_some() || released.1.is_some() {
-        build_active.remove(&table);
+    retiring_builds: &mut HashSet<(TableId, BuildLane)>,
+) -> Vec<(BuildLane, Released<B, P>)> {
+    let mut released = Vec::new();
+    for lane in [BuildLane::Main, BuildLane::Side] {
+        if let Some(build) = ready_builds.remove(&(table, lane)) {
+            released.push((lane, Released::Build(build)));
+        }
+    }
+    if let Some(preparation) = ready_preparations.remove(&table) {
+        let lane = preparing.remove(&table).unwrap_or_default();
+        released.push((lane, Released::Preparation(preparation)));
+    }
+    for (lane, _) in &released {
+        match lane {
+            BuildLane::Main => build_active.remove(&table),
+            BuildLane::Side => side_active.remove(&table),
+        };
         activation_pending.remove(&table);
         waiting_for_build.remove(&table);
-        retiring_builds.insert(table);
+        retiring_builds.insert((table, *lane));
     }
     released
+}
+
+/// Whether any lane of `table` has a worker retiring after a deadline.
+fn retiring(retiring_builds: &HashSet<(TableId, BuildLane)>, table: TableId) -> bool {
+    [BuildLane::Main, BuildLane::Side]
+        .into_iter()
+        .any(|lane| retiring_builds.contains(&(table, lane)))
+}
+
+/// Whether a side build may start beside `table`'s running main build once
+/// its maintenance is due. Hard pressure waiting for that build makes it due
+/// at once and admits it without optional capacity; a declined probe makes
+/// it due again a second later.
+#[allow(clippy::too_many_arguments)]
+fn side_build_ready(
+    table: TableId,
+    now: Instant,
+    optional_allowed: bool,
+    lanes_free: bool,
+    main_inputs: &HashMap<TableId, Arc<BTreeSet<FileId>>>,
+    side_active: &HashSet<TableId>,
+    waiting_for_build: &HashSet<TableId>,
+    maintenance_due: &BTreeMap<TableId, Instant>,
+) -> bool {
+    lanes_free
+        && main_inputs.contains_key(&table)
+        && !side_active.contains(&table)
+        && (optional_allowed || waiting_for_build.contains(&table))
+        && maintenance_due.get(&table).is_some_and(|due| *due <= now)
 }
 
 /// One periodic visit runs at a time: the most overdue eligible table.
@@ -701,9 +748,19 @@ impl PublishRuntime {
         // leaving one actor slot reusable for publication. Reservations span
         // capture, build, preparation, ready candidates and finalization.
         let background_build_limit = config.limits.table_workers.saturating_sub(1).min(2);
+        // Main-lane reservations: any background build, from capture through
+        // finalization.
         let mut build_active = HashSet::new();
+        // Side-lane reservations: an L0 build beside a running main build.
+        // Both lanes share `background_build_limit`.
+        let mut side_active = HashSet::<TableId>::new();
+        // The inputs of each running main build, which a side build excludes.
+        let mut main_inputs = HashMap::<TableId, Arc<BTreeSet<FileId>>>::new();
+        // The lane whose candidate holds a table's single preparation and
+        // activation pipeline, from handoff until activation or retirement.
+        let mut preparing = HashMap::<TableId, BuildLane>::new();
         let mut builds = FuturesUnordered::<BoxFuture<'static, BuildCompletion>>::new();
-        let mut ready_builds = BTreeMap::<TableId, CompletedBuild>::new();
+        let mut ready_builds = BTreeMap::<(TableId, BuildLane), CompletedBuild>::new();
         let mut preparations = FuturesUnordered::<BoxFuture<'static, PreparationCompletion>>::new();
         let mut retirements = FuturesUnordered::<BoxFuture<'static, RetirementCompletion>>::new();
         let mut ready_preparations = BTreeMap::<TableId, CompletedPreparation>::new();
@@ -711,7 +768,7 @@ impl PublishRuntime {
         // Timed-out workers retain durable ownership and resource accounting,
         // but are no longer candidates that may pause foreground publication.
         // New builds wait until every retiring worker has joined.
-        let mut retiring_builds = HashSet::new();
+        let mut retiring_builds = HashSet::<(TableId, BuildLane)>::new();
         // Preparation reads a frozen index snapshot. Briefly gate this table's
         // next epoch, then allow CDC while slower candidates finish off-lane.
         let mut activation_pending = HashSet::new();
@@ -789,12 +846,20 @@ impl PublishRuntime {
                 && !periodic_active
                 && !(periodic_yield_to_cdc
                     && cdc_deadline.is_some_and(|due| due <= Instant::now()));
+            let lanes_free = work.compaction
+                && config.compaction.data_rewrite_scope
+                    != flow_compactor::DataRewriteScope::Disabled
+                && build_active.len() + side_active.len() < background_build_limit
+                && retiring_builds.is_empty();
             let deadline = if (optional_allowed
                 && idle_work
                     .iter()
                     .any(|id| !excluded.contains(id) && blocked.get(*id).is_none()))
-                || ready_builds.keys().any(|id| {
-                    !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                || ready_builds.keys().any(|(id, _)| {
+                    !busy.contains(id)
+                        && !excluded.contains(id)
+                        && blocked.get(*id).is_none()
+                        && !preparing.contains_key(id)
                 })
                 || ready_preparations.keys().any(|id| {
                     !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
@@ -813,9 +878,31 @@ impl PublishRuntime {
                                     && !excluded.contains(*id)
                                     && blocked.get(**id).is_none()
                                     && !build_active.contains(*id)
-                                    && !retiring_builds.contains(*id)
+                                    && !side_active.contains(*id)
+                                    && !retiring(&retiring_builds, **id)
                             })
                             .map(|(_, due)| *due),
+                    )
+                    .chain(
+                        // A side build beside a running main build.
+                        main_inputs
+                            .keys()
+                            .filter(|id| {
+                                !busy.contains(*id)
+                                    && !excluded.contains(*id)
+                                    && blocked.get(**id).is_none()
+                                    && side_build_ready(
+                                        **id,
+                                        Instant::now() + Duration::from_secs(3600),
+                                        optional_allowed,
+                                        lanes_free,
+                                        &main_inputs,
+                                        &side_active,
+                                        &waiting_for_build,
+                                        &maintenance_due,
+                                    )
+                            })
+                            .map(|id| maintenance_due[id]),
                     )
                     .chain(
                         blocked
@@ -895,7 +982,24 @@ impl PublishRuntime {
                 }
                 _ = prefolds.woken() => {}
                 Some(result) = running.next(), if !running.is_empty() => {
-                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build, finalization_lane, periodic_maintenance } = result?;
+                    let TableCompletion { id, transactions, outcome, elapsed, reserved_build, lane, finalization_lane, periodic_maintenance } = result?;
+                    // Every outcome of a reserved run except a started build or
+                    // preparation ends that lane's reservation.
+                    let release_lane = |build_active: &mut HashSet<TableId>,
+                                        side_active: &mut HashSet<TableId>,
+                                        preparing: &mut HashMap<TableId, BuildLane>,
+                                        activation_pending: &mut HashSet<TableId>,
+                                        waiting_for_build: &mut HashSet<TableId>| {
+                        match lane {
+                            BuildLane::Main => build_active.remove(&id),
+                            BuildLane::Side => side_active.remove(&id),
+                        };
+                        if preparing.get(&id) == Some(&lane) {
+                            preparing.remove(&id);
+                            activation_pending.remove(&id);
+                        }
+                        waiting_for_build.remove(&id);
+                    };
                     // Only a published CDC epoch leaves the next epoch's fold valid.
                     if !matches!(outcome, TableOutcome::Complete { operation: Some(_), .. }) {
                         prefolds.discard(id, "epoch_not_published");
@@ -921,9 +1025,8 @@ impl PublishRuntime {
                             observation.table_states(store, ledger, &blocked, [id])?;
                             observation.write(config, ledger, capture_goal, true)?;
                             if reserved_build {
-                                build_active.remove(&id);
-                                activation_pending.remove(&id);
-                                waiting_for_build.remove(&id);
+                                release_lane(&mut build_active, &mut side_active, &mut preparing,
+                                    &mut activation_pending, &mut waiting_for_build);
                             }
                             maintenance_due.remove(&id);
                             periodic_due.remove(&id);
@@ -931,18 +1034,20 @@ impl PublishRuntime {
                         }
                         TableOutcome::Recovered => {
                             if reserved_build {
-                                build_active.remove(&id);
-                                activation_pending.remove(&id);
-                                waiting_for_build.remove(&id);
+                                release_lane(&mut build_active, &mut side_active, &mut preparing,
+                                    &mut activation_pending, &mut waiting_for_build);
                             }
                             pending.defer(id, &mut scheduler);
                             blocked.clear(id)?;
                         }
                         TableOutcome::Build(build) => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build handoff");
+                            if lane == BuildLane::Main {
+                                main_inputs.insert(id, build.running.input_files().clone());
+                            }
                             builds.push(Box::pin(async move {
                                 let StartedBuild { running, path, started } = *build;
-                                BuildCompletion { id, path, started, result: running.wait().await }
+                                BuildCompletion { id, lane, path, started, result: running.wait().await }
                             }));
                             maintenance_due.remove(&id);
                         }
@@ -952,13 +1057,16 @@ impl PublishRuntime {
                         }
                         TableOutcome::ProbeComplete => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background build probe");
-                            build_active.remove(&id);
+                            match lane {
+                                BuildLane::Main => build_active.remove(&id),
+                                BuildLane::Side => side_active.remove(&id),
+                            };
                             maintenance_due.insert(id, Instant::now() + OPTIONAL_MAINTENANCE_DELAY);
                         }
                         TableOutcome::Preparation(preparation) => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid background preparation handoff");
                             ensure!(
-                                activation_pending.insert(id),
+                                activation_pending.insert(id) && preparing.insert(id, lane).is_none(),
                                 "duplicate compaction preparation handoff"
                             );
                             scheduler.stall(id, true);
@@ -986,6 +1094,7 @@ impl PublishRuntime {
                                 };
                                 PreparationCompletion {
                                     id,
+                                    lane,
                                     path,
                                     started,
                                     activation_stall_started,
@@ -1000,8 +1109,12 @@ impl PublishRuntime {
                             ensure!(!reserved_build, "build reservation deferred behind itself");
                             // The ledger retains the epoch; admission reloads it in order.
                             pending.defer(id, &mut scheduler);
-                            if build_active.contains(&id) {
-                                waiting_for_build.insert(id);
+                            if build_active.contains(&id) || side_active.contains(&id) {
+                                // A side build may relieve L0 pressure before the
+                                // running build finishes.
+                                if waiting_for_build.insert(id) && main_inputs.contains_key(&id) {
+                                    maintenance_due.insert(id, Instant::now());
+                                }
                                 scheduler.stall(id, true);
                                 tracing::info!(event = "compaction_build_pressure", table = ?id,
                                     "hard pressure paused publication until the local build completes");
@@ -1009,11 +1122,12 @@ impl PublishRuntime {
                         }
                         TableOutcome::CandidateInvalidated => {
                             ensure!(reserved_build && transactions.is_empty(), "invalid candidate retirement");
-                            build_active.remove(&id);
-                            activation_pending.remove(&id);
-                            let hard_pressure = waiting_for_build.remove(&id);
+                            let hard_pressure = waiting_for_build.contains(&id);
+                            release_lane(&mut build_active, &mut side_active, &mut preparing,
+                                &mut activation_pending, &mut waiting_for_build);
                             scheduler.stall(id, false);
-                            if hard_pressure {
+                            // A main build still running remains the way out.
+                            if hard_pressure && !main_inputs.contains_key(&id) {
                                 fenced_fallback.insert(id);
                             }
                             maintenance_due.insert(id, Instant::now());
@@ -1021,9 +1135,8 @@ impl PublishRuntime {
                         TableOutcome::Complete { snapshot, operation, maintenance_pending } => {
                             let completion_started = Instant::now();
                             if reserved_build {
-                                build_active.remove(&id);
-                                activation_pending.remove(&id);
-                                waiting_for_build.remove(&id);
+                                release_lane(&mut build_active, &mut side_active, &mut preparing,
+                                    &mut activation_pending, &mut waiting_for_build);
                             }
                             scheduler.record_completion(id, elapsed);
                             for batch in transactions.chunks(ledger.batch_capacity()) {
@@ -1068,23 +1181,29 @@ impl PublishRuntime {
                     }
                 }
                 Some(completion) = builds.next(), if !builds.is_empty() => {
-                    let BuildCompletion { id, path, started, result } = completion;
+                    let BuildCompletion { id, lane, path, started, result } = completion;
+                    if lane == BuildLane::Main {
+                        main_inputs.remove(&id);
+                    }
                     match result {
                         Ok(ready) => {
-                            tracing::info!(event = "compaction_build_ready", table = ?id,
+                            tracing::info!(event = "compaction_build_ready", table = ?id, lane = lane.as_str(),
                                 elapsed_ms = started.elapsed().as_millis(), "local compaction worker joined");
-                            ready_builds.insert(id, CompletedBuild { ready, path, started });
+                            ready_builds.insert((id, lane), CompletedBuild { ready, path, started });
                         }
                         Err(error) => {
                             // wait() joins the actual worker before releasing ownership.
                             remove_scratch(path);
-                            build_active.remove(&id);
+                            match lane {
+                                BuildLane::Main => build_active.remove(&id),
+                                BuildLane::Side => side_active.remove(&id),
+                            };
                             let hard_pressure = waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
                             if !retry_table_work(&error) { return Err(error); }
-                            tracing::warn!(event = "compaction_build_discarded", table = ?id, %error,
-                                hard_pressure, "local build invalidated; scheduling maintenance");
-                            if hard_pressure {
+                            tracing::warn!(event = "compaction_build_discarded", table = ?id, lane = lane.as_str(),
+                                %error, hard_pressure, "local build invalidated; scheduling maintenance");
+                            if hard_pressure && !main_inputs.contains_key(&id) {
                                 fenced_fallback.insert(id);
                             }
                             maintenance_due.insert(id, Instant::now());
@@ -1094,6 +1213,7 @@ impl PublishRuntime {
                 Some(completion) = preparations.next(), if !preparations.is_empty() => {
                     let PreparationCompletion {
                         id,
+                        lane,
                         path,
                         started,
                         mut activation_stall_started,
@@ -1140,7 +1260,7 @@ impl PublishRuntime {
                             preparations.push(Box::pin(async move {
                                 let remaining = BUILD_MAX_AGE.saturating_sub(started.elapsed());
                                 PreparationCompletion {
-                                    id, path, started, activation_stall_started,
+                                    id, lane, path, started, activation_stall_started,
                                     publication_resumed: true,
                                     result: retiring.into_running().wait_for(remaining).await,
                                 }
@@ -1170,13 +1290,18 @@ impl PublishRuntime {
                                 "joining preparation after its build-age limit"
                             );
                             activation_pending.remove(&id);
-                            build_active.remove(&id);
-                            retiring_builds.insert(id);
+                            preparing.remove(&id);
+                            match lane {
+                                BuildLane::Main => build_active.remove(&id),
+                                BuildLane::Side => side_active.remove(&id),
+                            };
+                            retiring_builds.insert((id, lane));
                             waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
                             retirements.push(Box::pin(async move {
                                 RetirementCompletion {
                                     id,
+                                    lane,
                                     path,
                                     result: retiring.wait().await,
                                 }
@@ -1185,8 +1310,12 @@ impl PublishRuntime {
                         Err(error) => {
                             // wait() joins the actual worker before releasing BUILD.
                             remove_scratch(path);
-                            build_active.remove(&id);
+                            match lane {
+                                BuildLane::Main => build_active.remove(&id),
+                                BuildLane::Side => side_active.remove(&id),
+                            };
                             activation_pending.remove(&id);
+                            preparing.remove(&id);
                             let hard_pressure = waiting_for_build.remove(&id);
                             scheduler.stall(id, busy.contains(&id));
                             if !retry_table_work(&error) { return Err(error); }
@@ -1208,7 +1337,7 @@ impl PublishRuntime {
                                 error = %format!("{error:#}"),
                                 "background compaction preparation invalidated; scheduling maintenance"
                             );
-                            if hard_pressure {
+                            if hard_pressure && !main_inputs.contains_key(&id) {
                                 fenced_fallback.insert(id);
                             }
                             maintenance_due.insert(id, Instant::now());
@@ -1216,9 +1345,9 @@ impl PublishRuntime {
                     }
                 }
                 Some(completion) = retirements.next(), if !retirements.is_empty() => {
-                    let RetirementCompletion { id, path, result } = completion;
+                    let RetirementCompletion { id, lane, path, result } = completion;
                     remove_scratch(path);
-                    retiring_builds.remove(&id);
+                    retiring_builds.remove(&(id, lane));
                     let hard_pressure = waiting_for_build.remove(&id);
                     scheduler.stall(id, busy.contains(&id));
                     if let Err(error) = result {
@@ -1268,9 +1397,21 @@ impl PublishRuntime {
                             .keys()
                             .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
                             .copied();
+                        // A table runs one preparation and activation at a time;
+                        // another lane's completed build waits for that pipeline.
                         let built = ready_builds
                             .keys()
-                            .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none())
+                            .find(|(id, _)| !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
+                                && !preparing.contains_key(id))
+                            .copied();
+                        let lanes_free = work.compaction && background_build_limit > 0
+                            && config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+                            && build_active.len() + side_active.len() < background_build_limit
+                            && retiring_builds.is_empty();
+                        let side = main_inputs.keys()
+                            .find(|id| !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
+                                && side_build_ready(**id, now, optional_allowed, lanes_free, &main_inputs,
+                                    &side_active, &waiting_for_build, &maintenance_due))
                             .copied();
                         let overdue = maintenance_due.iter()
                             .filter(|(id, due)| {
@@ -1278,7 +1419,8 @@ impl PublishRuntime {
                                     && (optional_allowed || fenced_fallback.contains(*id))
                                     && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
                                     && !build_active.contains(*id)
-                                    && !retiring_builds.contains(*id)
+                                    && !side_active.contains(*id)
+                                    && !retiring(&retiring_builds, **id)
                             })
                             .min_by_key(|(_, due)| **due)
                             .map(|(id, _)| *id);
@@ -1288,7 +1430,8 @@ impl PublishRuntime {
                         let periodic = if periodic_allowed && !(periodic_yield_to_cdc && cdc_ready) {
                             next_periodic_visit(&periodic_due, periodic_active, now, |id| {
                                 !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
-                                    && !build_active.contains(id) && !retiring_builds.contains(id)
+                                    && !build_active.contains(id) && !side_active.contains(id)
+                                    && !retiring(&retiring_builds, *id)
                             })
                         } else {
                             None
@@ -1297,15 +1440,11 @@ impl PublishRuntime {
                         // build until reader debt requires a synchronous rewrite.
                         // The probe replaces its slot with a build. At least
                         // one other actor slot remains reusable for CDC.
-                        let probe = if optional_allowed && work.compaction && background_build_limit > 0
-                            && config.compaction.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
-                            && build_active.len() < background_build_limit
-                            && retiring_builds.is_empty()
-                            && cdc_ready
-                        {
+                        let probe = if optional_allowed && lanes_free && cdc_ready {
                             maintenance_due.iter()
                                 .filter(|(id, due)| **due <= now && !busy.contains(*id) && !excluded.contains(*id) && blocked.get(**id).is_none()
-                                    && !build_active.contains(*id) && !retiring_builds.contains(*id)
+                                    && !build_active.contains(*id) && !side_active.contains(*id)
+                                    && !retiring(&retiring_builds, **id)
                                     && !fenced_fallback.contains(*id))
                                 .min_by_key(|(_, due)| **due)
                                 .map(|(id, _)| *id)
@@ -1328,12 +1467,15 @@ impl PublishRuntime {
                                     config.limits.pending_transactions, &excluded)?;
                                 continue;
                         }
+                        // The lane a candidate run finalizes, or a side visit reserves.
+                        let mut lane = BuildLane::Main;
                         let (id, idle, candidate) = if let Some(id) = retry {
                             blocked.release_due(id);
                             retrying.insert(id);
                             retry_yield_to_cdc = true;
                             (id, true, None)
                         } else if let Some(id) = prepared {
+                            lane = preparing.get(&id).copied().unwrap_or_default();
                             (
                                 id,
                                 true,
@@ -1341,14 +1483,18 @@ impl PublishRuntime {
                                     ready_preparations.remove(&id).expect("selected preparation"),
                                 )),
                             )
-                        } else if let Some(id) = built {
+                        } else if let Some((id, built_lane)) = built {
+                            lane = built_lane;
                             (
                                 id,
                                 true,
                                 Some(CompactionCandidate::Built(
-                                    ready_builds.remove(&id).expect("selected build"),
+                                    ready_builds.remove(&(id, built_lane)).expect("selected build"),
                                 )),
                             )
+                        } else if let Some(id) = side {
+                            lane = BuildLane::Side;
+                            (id, true, None)
                         } else if let Some(id) = periodic {
                             (id, true, None)
                         } else if let Some(id) = probe {
@@ -1359,7 +1505,8 @@ impl PublishRuntime {
                         } else if let Some(id) = overdue {
                             (id, true, None)
                         } else if optional_allowed && let Some(id) = idle_work.pop_front() {
-                            if excluded.contains(&id) || build_active.contains(&id) || retiring_builds.contains(&id) {
+                            if excluded.contains(&id) || build_active.contains(&id) || side_active.contains(&id)
+                                || retiring(&retiring_builds, id) {
                                 continue;
                             }
                             if ledger.watermarks().journal_durable_lsn < capture_goal
@@ -1379,8 +1526,10 @@ impl PublishRuntime {
                             scheduler.stall(id, true);
                             continue;
                         }
-                        let periodic_maintenance = periodic == Some(id) && candidate.is_none();
-                        let probing = !periodic_maintenance && probe == Some(id) && candidate.is_none();
+                        let side_probing = side == Some(id) && candidate.is_none() && lane == BuildLane::Side;
+                        let periodic_maintenance = !side_probing && periodic == Some(id) && candidate.is_none();
+                        let probing = !side_probing && !periodic_maintenance && probe == Some(id)
+                            && candidate.is_none();
                         if periodic_maintenance {
                             periodic_active = true;
                             periodic_yield_to_cdc = true;
@@ -1403,8 +1552,22 @@ impl PublishRuntime {
                             }
                             idle_work.retain(|queued| *queued != id);
                         }
+                        let side_scope = side_probing.then(|| BuildScope {
+                            exclude: main_inputs[&id].clone(),
+                            l0_only: true,
+                        });
+                        if side_probing {
+                            tracing::info!(event = "compaction_side_build_probe_admitted", table_id = id.0,
+                                hard_pressure = waiting_for_build.contains(&id),
+                                queued_transactions = pending.tables.get(&id).map_or(0, VecDeque::len),
+                                excluded_files = main_inputs[&id].len(),
+                                "admitting L0 build capture beside a running build");
+                        }
                         let build_admission = if retry == Some(id) {
                             BuildAdmission::Fenced
+                        } else if side_probing {
+                            side_active.insert(id);
+                            BuildAdmission::Side
                         } else if periodic_maintenance {
                             BuildAdmission::Wait
                         } else if probing {
@@ -1417,8 +1580,9 @@ impl PublishRuntime {
                             BuildAdmission::Fenced
                         } else if background_build_limit == 0 || fenced_fallback.remove(&id) {
                             BuildAdmission::Fenced
-                        } else if idle && build_active.len() < background_build_limit
-                            && !build_active.contains(&id) && retiring_builds.is_empty()
+                        } else if idle && build_active.len() + side_active.len() < background_build_limit
+                            && !build_active.contains(&id) && !side_active.contains(&id)
+                            && retiring_builds.is_empty()
                         {
                             build_active.insert(id);
                             BuildAdmission::Start
@@ -1428,9 +1592,12 @@ impl PublishRuntime {
                         let lane_acquired_at = Instant::now();
                         let options = WorkOptions {
                             periodic_maintenance,
-                            build_active: candidate.is_none() && build_active.contains(&id)
-                                && !matches!(build_admission, BuildAdmission::Start | BuildAdmission::Probe),
+                            build_active: candidate.is_none()
+                                && (build_active.contains(&id) || side_active.contains(&id))
+                                && !matches!(build_admission,
+                                    BuildAdmission::Start | BuildAdmission::Probe | BuildAdmission::Side),
                             build_admission,
+                            lane,
                             actor_acquired_at: lane_acquired_at,
                         };
                         let transactions = if idle { Vec::new() } else { pending.take_epoch(id, ledger)? };
@@ -1476,6 +1643,7 @@ impl PublishRuntime {
                                 candidate,
                                 finalization_lane,
                                 prefold,
+                                side_scope,
                             )
                             .await
                         }));
@@ -1503,18 +1671,21 @@ impl PublishRuntime {
                             }
                         }
                         if blocked.get(id).is_some_and(BlockedTable::requires_resync) {
-                            let (build, preparation) = release_blocked_candidates(
-                                id, &mut ready_builds, &mut ready_preparations, &mut build_active,
-                                &mut activation_pending, &mut waiting_for_build, &mut retiring_builds);
-                            if build.is_some() || preparation.is_some() {
+                            let released = release_blocked_candidates(
+                                id, &mut ready_builds, &mut ready_preparations, &mut preparing,
+                                &mut build_active, &mut side_active, &mut activation_pending,
+                                &mut waiting_for_build, &mut retiring_builds);
+                            if !released.is_empty() {
                                 scheduler.stall(id, busy.contains(&id));
                             }
-                            for (path, discard) in [
-                                build.map(|build| (build.path, build.ready.discard().boxed())),
-                                preparation.map(|candidate| (candidate.path, candidate.prepared.discard().boxed())),
-                            ].into_iter().flatten() {
+                            for (lane, candidate) in released {
+                                let (path, discard) = match candidate {
+                                    Released::Build(build) => (build.path, build.ready.discard().boxed()),
+                                    Released::Preparation(candidate) =>
+                                        (candidate.path, candidate.prepared.discard().boxed()),
+                                };
                                 retirements.push(Box::pin(async move {
-                                    RetirementCompletion { id, path, result: discard.await }
+                                    RetirementCompletion { id, lane, path, result: discard.await }
                                 }));
                             }
                             // Whenever no run owns it, its reservations (including ones a
@@ -1548,7 +1719,8 @@ impl PublishRuntime {
                         for id in schemas.keys() {
                             if !busy.contains(id) && !excluded.contains(id) && blocked.get(*id).is_none()
                                 && !build_active.contains(id)
-                                && !retiring_builds.contains(id)
+                                && !side_active.contains(id)
+                                && !retiring(&retiring_builds, *id)
                                 && pending.tables.get(id).is_none_or(VecDeque::is_empty)
                                 && !idle_work.contains(id)
                             {
@@ -1586,6 +1758,66 @@ impl PublishRuntime {
 mod maintenance_admission_tests {
     use super::*;
     use flow_coordinator::WalPressure;
+
+    /// A side build needs a running main build, a free lane and due
+    /// maintenance. Hard pressure waiting for the main build admits it without
+    /// optional capacity, but never ahead of its due time, so a declined probe
+    /// cannot spin while publication is paused.
+    #[test]
+    fn side_builds_need_a_running_main_build_and_due_maintenance() {
+        let (table, other) = (TableId(1), TableId(2));
+        let now = Instant::now();
+        let main_inputs = HashMap::from([(table, Arc::new(BTreeSet::new()))]);
+        let mut side_active = HashSet::new();
+        let mut waiting = HashSet::new();
+        let mut due = BTreeMap::from([(table, now), (other, now)]);
+        let ready = |id,
+                     optional,
+                     lanes_free,
+                     side: &HashSet<_>,
+                     waiting: &HashSet<_>,
+                     due: &BTreeMap<_, _>| {
+            side_build_ready(
+                id,
+                now,
+                optional,
+                lanes_free,
+                &main_inputs,
+                side,
+                waiting,
+                due,
+            )
+        };
+        assert!(ready(table, true, true, &side_active, &waiting, &due));
+        assert!(
+            !ready(other, true, true, &side_active, &waiting, &due),
+            "no main build"
+        );
+        assert!(
+            !ready(table, true, false, &side_active, &waiting, &due),
+            "lanes full"
+        );
+        assert!(
+            !ready(table, false, true, &side_active, &waiting, &due),
+            "no optional capacity"
+        );
+        waiting.insert(table);
+        assert!(
+            ready(table, false, true, &side_active, &waiting, &due),
+            "hard pressure"
+        );
+        due.insert(table, now + OPTIONAL_MAINTENANCE_DELAY);
+        assert!(
+            !ready(table, false, true, &side_active, &waiting, &due),
+            "declined probe waits"
+        );
+        due.insert(table, now);
+        side_active.insert(table);
+        assert!(
+            !ready(table, true, true, &side_active, &waiting, &due),
+            "one side build"
+        );
+    }
 
     #[test]
     fn warning_suppresses_optional_work_until_positive_recovery() {
@@ -1838,6 +2070,7 @@ const PREPARATION_STALL_LIMIT: Duration = Duration::from_millis(750);
 
 struct BuildCompletion {
     id: TableId,
+    lane: BuildLane,
     path: PathBuf,
     started: Instant,
     result: Result<ReadyCompaction>,
@@ -1845,6 +2078,7 @@ struct BuildCompletion {
 
 struct PreparationCompletion {
     id: TableId,
+    lane: BuildLane,
     path: PathBuf,
     started: Instant,
     activation_stall_started: Instant,
@@ -1854,6 +2088,7 @@ struct PreparationCompletion {
 
 struct RetirementCompletion {
     id: TableId,
+    lane: BuildLane,
     path: PathBuf,
     result: Result<()>,
 }
@@ -2307,10 +2542,14 @@ mod startup_recovery_tests {
         ledger
             .table_materialized_batch(&[PgLsn(20)], healthy, 5)
             .unwrap();
-        let mut ready_builds = BTreeMap::from([(dropped, "built")]);
-        let mut ready_preparations = BTreeMap::<TableId, &str>::new();
+        // The dropped table has a finished main build and a prepared side
+        // build; the running table's main preparation is still in flight.
+        let mut ready_builds = BTreeMap::from([((dropped, BuildLane::Main), "built")]);
+        let mut ready_preparations = BTreeMap::from([(dropped, "prepared")]);
+        let mut preparing = HashMap::from([(dropped, BuildLane::Side), (running, BuildLane::Main)]);
         let mut build_active = HashSet::from([dropped, running]);
-        let mut activation_pending = HashSet::from([running]);
+        let mut side_active = HashSet::from([dropped]);
+        let mut activation_pending = HashSet::from([running, dropped]);
         let mut waiting_for_build = HashSet::from([dropped]);
         let mut retiring_builds = HashSet::new();
         let mut release = |table| {
@@ -2318,18 +2557,35 @@ mod startup_recovery_tests {
                 table,
                 &mut ready_builds,
                 &mut ready_preparations,
+                &mut preparing,
                 &mut build_active,
+                &mut side_active,
                 &mut activation_pending,
                 &mut waiting_for_build,
                 &mut retiring_builds,
             )
+            .into_iter()
+            .map(|(lane, released)| match released {
+                Released::Build(build) => (lane, build),
+                Released::Preparation(prepared) => (lane, prepared),
+            })
+            .collect::<Vec<_>>()
         };
-        assert_eq!(release(dropped), (Some("built"), None));
+        assert_eq!(
+            release(dropped),
+            [(BuildLane::Main, "built"), (BuildLane::Side, "prepared")]
+        );
         // Still running: nothing to retire yet, and its state stays owned.
-        assert_eq!(release(running), (None, None));
+        assert!(release(running).is_empty());
         assert!(build_active.contains(&running) && activation_pending.contains(&running));
-        assert!(!build_active.contains(&dropped) && !waiting_for_build.contains(&dropped));
-        assert!(retiring_builds.contains(&dropped) && ready_builds.is_empty());
+        assert_eq!(preparing, HashMap::from([(running, BuildLane::Main)]));
+        assert!(!build_active.contains(&dropped) && !side_active.contains(&dropped));
+        assert!(!waiting_for_build.contains(&dropped) && !activation_pending.contains(&dropped));
+        assert_eq!(
+            retiring_builds,
+            HashSet::from([(dropped, BuildLane::Main), (dropped, BuildLane::Side)])
+        );
+        assert!(ready_builds.is_empty() && ready_preparations.is_empty());
 
         // Only a run owns the table's ledger share, so settling proceeds.
         while settle_resync_table(&mut ledger, &store, &mut blocked, dropped).unwrap() {}

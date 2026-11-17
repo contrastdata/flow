@@ -605,6 +605,25 @@ impl Policy {
             && debt.excess_target_delete_files > 0
     }
 
+    /// Whether the L0 files outside `excluded` alone reach a soft L0 limit, so
+    /// that a rewrite of only those files pays L0 debt. A table rewriting
+    /// other inputs in the background uses this to merge newer L0 files
+    /// beside it instead of letting them reach the hard limit.
+    pub fn l0_debt_outside(&self, files: &[FileCandidate], excluded: &BTreeSet<FileId>) -> bool {
+        let (mut count, mut bytes, mut oldest) = (0usize, 0u64, 0u64);
+        for file in files
+            .iter()
+            .filter(|file| file.level == Level::L0 && !excluded.contains(&file.id))
+        {
+            count += 1;
+            bytes = bytes.saturating_add(file.size_bytes);
+            oldest = oldest.max(file.age_ms);
+        }
+        count >= self.l0_soft_files
+            || bytes >= self.l0_soft_bytes
+            || count > 0 && oldest >= self.oldest_l0_soft_ms
+    }
+
     /// Pressure from delete-file count alone: the most delete files applying
     /// to one data file, or the table-wide shared delete-file count. With
     /// [`DeleteLayout::PerTarget`], [`Self::over_target_budget`] is soft.
@@ -747,8 +766,35 @@ impl Policy {
         files: &[FileCandidate],
         deletes: &[DeleteDependency],
     ) -> Result<Option<CompactionPlan>> {
+        self.plan_excluding(
+            base_snapshot_id,
+            schema_id,
+            files,
+            deletes,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// [`Self::plan`], never selecting a data file in `excluded`, such as the
+    /// inputs of a build still running on the same table. Debt still counts
+    /// every file, so an excluded file keeps its pressure until it is retired.
+    pub fn plan_excluding(
+        &self,
+        base_snapshot_id: i64,
+        schema_id: i32,
+        files: &[FileCandidate],
+        deletes: &[DeleteDependency],
+        excluded: &BTreeSet<FileId>,
+    ) -> Result<Option<CompactionPlan>> {
         let count_driven = self.delete_debt == DeleteDebt::Current;
-        let plan = self.plan_with(base_snapshot_id, schema_id, files, deletes, count_driven)?;
+        let plan = self.plan_with(
+            base_snapshot_id,
+            schema_id,
+            files,
+            deletes,
+            count_driven,
+            excluded,
+        )?;
         if plan.is_none()
             && !count_driven
             && self
@@ -757,7 +803,7 @@ impl Policy {
                 .max(self.table_delete_files(deletes))
                 >= self.delete_files_hard
         {
-            return self.plan_with(base_snapshot_id, schema_id, files, deletes, true);
+            return self.plan_with(base_snapshot_id, schema_id, files, deletes, true, excluded);
         }
         Ok(plan)
     }
@@ -929,6 +975,7 @@ impl Policy {
         files: &[FileCandidate],
         deletes: &[DeleteDependency],
         count_driven: bool,
+        excluded: &BTreeSet<FileId>,
     ) -> Result<Option<CompactionPlan>> {
         let debt = self.debt(files)?;
         let by_id: BTreeMap<_, _> = files.iter().map(|file| (&file.id, file)).collect();
@@ -987,6 +1034,7 @@ impl Policy {
                     DataRewriteScope::All => true,
                 };
                 in_scope
+                    && !excluded.contains(&file.id)
                     && (file.age_ms >= self.min_file_age_ms
                         || debt.pressure == PublicationPressure::Pause)
                     && match file.level {
