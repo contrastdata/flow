@@ -267,10 +267,15 @@ async fn catch_up_merges_overlapping_residuals_and_masks_into_bounded_cohorts() 
                 && entry.sequence_number == Some(base.metadata().last_sequence_number())
         })
         .unwrap();
+    // Shared residual cohorts; per-target pools these small targets in one
+    // range, which the per-target tests below cover.
     let maintenance = TableMaintenance::new(
         f.index.clone(),
         f.catalog.clone(),
-        compaction_policy(),
+        Policy {
+            delete_layout: flow_compactor::DeleteLayout::Shared,
+            ..compaction_policy()
+        },
         WriterConfig {
             row_group_rows: 2,
             ..Default::default()

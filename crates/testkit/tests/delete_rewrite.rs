@@ -503,6 +503,8 @@ async fn l0_rewrite_preserves_base_and_residuals_through_lost_response_and_index
             deleted_rows_percent: 100,
             min_file_age_ms: 0,
             lazy_index_remap: lazy,
+            // Shared residual cohorts split at the one-row group limit.
+            delete_layout: flow_compactor::DeleteLayout::Shared,
             ..Default::default()
         };
         let maintenance = TableMaintenance::new(

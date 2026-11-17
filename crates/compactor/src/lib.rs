@@ -46,7 +46,6 @@ pub enum DeleteDebt {
 pub enum DeleteLayout {
     /// Delete-only consolidation merges its inputs into shared files and data
     /// rewrites keep residual positions in at most eight shared ranges.
-    #[default]
     Shared,
     /// Delete-only consolidation and data-rewrite residuals write one file per
     /// full-size target data file, with exact single-path bounds, and pooled
@@ -54,6 +53,7 @@ pub enum DeleteLayout {
     /// merges a target's existing files by size tier. CDC epochs still write
     /// one shared file. Format v3 tables keep one deletion vector per data file
     /// and use [`DeleteLayout::Shared`]; see [`Policy::for_format_version`].
+    #[default]
     #[serde(alias = "per-target")]
     PerTarget,
 }
@@ -323,7 +323,7 @@ impl Default for Policy {
             min_file_age_ms: 1_000,
             lazy_index_remap: true,
             delete_debt: DeleteDebt::Consolidate,
-            delete_layout: DeleteLayout::Shared,
+            delete_layout: DeleteLayout::PerTarget,
             small_file_target_deletes: 8,
             target_delete_files_max: 16,
             target_delete_min_file_bytes: 128 << 20,

@@ -302,9 +302,10 @@ depend on that rewrite retiring sparse vectors.
 
 ## Per-target delete layout
 
-With `[compaction] delete_layout = "per_target"` (default `"shared"`), format
-v2 tables keep rewritten position deletes on each full-size data file in one
-file per data file, whose equal lower and upper `file_path` bounds name it.
+With `[compaction] delete_layout = "per_target"`, the default, format v2
+tables keep rewritten position deletes on each full-size data file in one file
+per data file, whose equal lower and upper `file_path` bounds name it.
+`"shared"` keeps the earlier shared files.
 A data file is full-size outside L0 at `target_delete_min_file_bytes`
 (128 MiB, like `l1_target_bytes`) or more. In a table with less than four times
 that outside L0, a file holding at least a quarter of those bytes is also

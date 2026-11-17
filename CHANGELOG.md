@@ -17,6 +17,10 @@ This will be the initial public release, `0.1.0`.
 
 From earlier development builds of `main`:
 
+- `delete_layout` now defaults to `"per_target"`. Existing format v2 tables
+  keep their shared delete files until consolidation or a data rewrite
+  replaces them; set `delete_layout = "shared"` to keep the previous
+  layout. Both layouts are ordinary position-delete files to Iceberg readers.
 - Background build ownership records are keyed by table and operation
   (`active-build/v2/`); startup still discards the earlier per-table records.
   An earlier build cannot open a state directory that retains a v2 record,
@@ -281,6 +285,13 @@ From earlier development builds of `main`:
 
 **Performance**
 
+- `[compaction] delete_layout` defaults to `"per_target"`: format v2 tables
+  keep one delete file per full-size data file, with deletes on L0 and small
+  files in pooled ranges, instead of shared files. On a 2M-row update-heavy
+  workload with side builds, commit-to-catalog p95 fell from 8.2 s to 0.93 s
+  against the previous build, at 15% more CDC service time per mutation; a
+  100k-row mixed workload was unchanged (release, 3 runs per side).
+  `delete_layout = "shared"` restores the previous layout.
 - With `delete_layout = "per_target"`, a data file outside L0 holding at least
   a quarter of a smaller table's bytes outside L0 is full-size, down to
   16 MiB, so it keeps its own delete files without lowering

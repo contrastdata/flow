@@ -831,6 +831,7 @@ fn format_v3_tables_pay_delete_file_count_with_a_data_rewrite() {
             "{:?}",
             Policy {
                 delete_debt: DeleteDebt::Current,
+                delete_layout: DeleteLayout::Shared,
                 ..Policy::default()
             }
         )
@@ -976,6 +977,7 @@ fn per_target_merges_respect_the_remaining_budget_most_files_first() {
 fn per_target_layout_charges_only_shared_dependencies_table_wide() {
     let shared = Policy {
         min_file_age_ms: 0,
+        delete_layout: DeleteLayout::Shared,
         ..Policy::default()
     };
     let per_target = Policy {
@@ -1355,10 +1357,8 @@ fn hard_l0_debt_blocked_by_its_deletes_asks_for_repair_not_other_files() {
 fn per_target_full_size_threshold_scales_down_to_a_quarter_of_a_small_table() {
     use flow_compactor::{FULL_SIZE_FLOOR_BYTES, FULL_SIZE_TABLE_SHARE};
     use iceberg::spec::FormatVersion;
-    let per_target = Policy {
-        delete_layout: DeleteLayout::PerTarget,
-        ..Default::default()
-    };
+    let per_target = Policy::default();
+    assert_eq!(per_target.delete_layout, DeleteLayout::PerTarget);
     let stable = |id, bytes| {
         let mut file = file(id, bytes);
         file.level = Level::L2;
@@ -1392,8 +1392,12 @@ fn per_target_full_size_threshold_scales_down_to_a_quarter_of_a_small_table() {
         per_target.target_delete_min_file_bytes
     );
     files.truncate(3);
+    let shared = Policy {
+        delete_layout: DeleteLayout::Shared,
+        ..Policy::default()
+    };
     for policy in [
-        Policy::default().for_table(FormatVersion::V2, &files),
+        shared.for_table(FormatVersion::V2, &files),
         per_target.for_table(FormatVersion::V3, &files),
     ] {
         assert_eq!(

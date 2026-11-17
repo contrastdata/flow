@@ -711,11 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_layout_defaults_to_shared_and_accepts_per_target() {
+    fn delete_layout_defaults_to_per_target_and_accepts_shared() {
         let example = include_str!("../../../examples/flow.toml");
         assert_eq!(
             valid_config().compaction.delete_layout,
-            flow_compactor::DeleteLayout::Shared
+            flow_compactor::DeleteLayout::PerTarget
         );
         for (value, expected) in [
             ("shared", flow_compactor::DeleteLayout::Shared),
