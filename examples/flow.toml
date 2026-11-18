@@ -113,11 +113,13 @@ prefetch_file_bytes = 4194304
 # delete_debt = "consolidate"
 # "per_target" makes delete consolidation and data-rewrite residuals write one
 # position-delete file per full-size target data file, merging a target's
-# files by size tier, and pooled ranges for L0 and smaller files, instead of
-# shared files. Format v3 tables always use "shared".
-# delete_layout = "shared"
+# files by size tier, and pooled ranges for L0 and smaller files; "shared"
+# writes shared files instead. Format v3 tables always use "shared".
+# delete_layout = "per_target"
 # With "per_target", data files outside L0 of at least this size keep one
-# delete file each; deletes on smaller and L0 files share range files.
+# delete file each; deletes on smaller and L0 files share range files. In a
+# smaller table, a file holding a quarter of the bytes outside L0 is
+# full-size too, down to 16 MiB.
 # target_delete_min_file_bytes = 134217728
 # With "per_target", once full-size data files keep this many single-target
 # delete files table-wide and one keeps more than one, consolidation merges

@@ -7,11 +7,11 @@ use anyhow::{Result, ensure};
 use flow_compactor::{BuiltData, CatchUpRejected, Level};
 use flow_iceberg_ext::CommitBase;
 use flow_materializer::iceberg_schema;
-use flow_model::{OperationId, TableSchema};
+use flow_model::{FileId, OperationId, TableSchema};
 use flow_state_store::{OperationKind, OperationPhase, PreparedOperation, StateStore, TableState};
 use iceberg::table::Table;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,11 +21,28 @@ use std::{
 
 const MAX_BUILD_TIME: Duration = Duration::from_secs(30);
 
+/// Which files a background build may select.
+///
+/// A table may run a second build beside the first, over files the first did
+/// not select. Its catch-up treats the other build's commit like any rewrite
+/// of unselected files: replaced position deletes must keep every base
+/// delete, and the selected inputs must be unchanged. Excluding the running
+/// build's inputs keeps either commit from invalidating the other.
+#[derive(Debug, Clone, Default)]
+pub struct BuildScope {
+    /// Data files that must not be selected, such as another running
+    /// build's inputs.
+    pub exclude: Arc<BTreeSet<FileId>>,
+    /// Select only L0 files, with the L0 grouping rules.
+    pub l0_only: bool,
+}
+
 /// Await outside the table actor's busy slot. Dropping this handle intentionally
 /// leaves durable ownership for restart cleanup; it cannot stop blocking I/O.
 #[must_use = "join the worker before releasing its scratch directory"]
 pub struct RunningCompaction {
     worker: tokio::task::JoinHandle<Result<BuiltData>>,
+    inputs: Arc<BTreeSet<FileId>>,
     ownership: BuildRegistration,
     cancelled: Arc<AtomicBool>,
     base: CommitBase,
@@ -36,6 +53,11 @@ pub struct RunningCompaction {
 }
 
 impl RunningCompaction {
+    /// The data files this build selected.
+    pub fn input_files(&self) -> &Arc<BTreeSet<FileId>> {
+        &self.inputs
+    }
+
     pub async fn wait(mut self) -> Result<ReadyCompaction> {
         let remaining = MAX_BUILD_TIME.saturating_sub(self.started.elapsed());
         let outcome = match tokio::time::timeout(remaining, &mut self.worker).await {
@@ -263,6 +285,18 @@ impl TableMaintenance {
         schema: &TableSchema,
         scratch: StateStore,
     ) -> Result<Option<RunningCompaction>> {
+        self.start_compaction_scoped(table, schema, scratch, &BuildScope::default())
+            .await
+    }
+
+    /// [`Self::start_compaction`] over the files `scope` admits.
+    pub async fn start_compaction_scoped(
+        &self,
+        table: &Table,
+        schema: &TableSchema,
+        scratch: StateStore,
+        scope: &BuildScope,
+    ) -> Result<Option<RunningCompaction>> {
         let table = self.catalog.load_table(table.identifier()).await?;
         ensure!(
             crate::same_iceberg_schema(table.metadata().current_schema(), &iceberg_schema(schema)?),
@@ -272,15 +306,20 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, schema.table_id).await?;
-        let Some(mut plan) = self
+        let mut policy = self
             .policy
-            .for_format_version(table.metadata().format_version())
-            .plan(
-                snapshot,
-                table.metadata().current_schema_id(),
-                &inventory.files,
-                &inventory.deletes,
-            )?
+            .for_table(table.metadata().format_version(), &inventory.files);
+        if scope.l0_only && policy.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
+        {
+            policy.to_mut().data_rewrite_scope = flow_compactor::DataRewriteScope::L0Only;
+        }
+        let Some(mut plan) = policy.plan_excluding(
+            snapshot,
+            table.metadata().current_schema_id(),
+            &inventory.files,
+            &inventory.deletes,
+            &scope.exclude,
+        )?
         else {
             return Ok(None);
         };
@@ -292,6 +331,7 @@ impl TableMaintenance {
         };
         let operation = OperationId(format!("flow-{level}-rewrite-{}", uuid::Uuid::new_v4()));
         let selection_reason = plan.reason.as_str();
+        let inputs = Arc::new(plan.input_files.clone());
         let ownership_table = schema.table_id;
         let base = CommitBase::new(&table);
         let ownership = BuildRegistration::begin(
@@ -337,9 +377,11 @@ impl TableMaintenance {
             Ok(indexed) => {
                 tracing::info!(event = "compaction_build_started", operation_id = %ownership.operation_id().0,
                     base_snapshot_id = snapshot, materialized_lsn = %indexed.materialized_lsn, selection_reason,
+                    input_files = inputs.len(), l0_only = scope.l0_only, excluded_files = scope.exclude.len(),
                     "captured speculative compaction index snapshot");
                 Ok(Some(RunningCompaction {
                     worker,
+                    inputs,
                     ownership,
                     cancelled,
                     base,

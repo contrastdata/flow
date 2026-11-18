@@ -155,7 +155,7 @@ impl TableMaintenance {
             let inventory = self.inventory(&table, table_id).await?;
             match self
                 .policy
-                .for_format_version(table.metadata().format_version())
+                .for_table(table.metadata().format_version(), &inventory.files)
                 .plan(
                     base.snapshot_id.ok_or(ReplanRequired)?,
                     table.metadata().current_schema_id(),
@@ -520,18 +520,21 @@ impl TableMaintenance {
         view: SnapshotView,
     ) -> Result<Option<i64>> {
         let table_id = schema.table_id;
-        let cap = self.policy.target_delete_files();
         let inventory = self.inventory(table, table_id).await?;
+        // The full-size threshold scales with the table; see `Policy::for_table`.
+        let table_policy = self
+            .policy
+            .for_table(table.metadata().format_version(), &inventory.files)
+            .into_owned();
+        let cap = table_policy.target_delete_files();
         let full_size = inventory
             .files
             .iter()
-            .filter(|file| self.policy.full_size_target(file))
+            .filter(|file| table_policy.full_size_target(file))
             .map(|file| file.id.clone())
             .collect::<BTreeSet<_>>();
         // Positions on L0 and small files share ranges; see `TargetRanges`.
-        let ranges = self
-            .policy
-            .target_ranges(&inventory.files, &BTreeSet::new());
+        let ranges = table_policy.target_ranges(&inventory.files, &BTreeSet::new());
         let worker_ranges = ranges.clone();
         let mut shared = Vec::new();
         let mut targeted = BTreeMap::<FileId, Vec<TargetDeleteFile>>::new();
@@ -598,7 +601,7 @@ impl TableMaintenance {
             files.len() >= 2 && files.len() + other_files.get(target).copied().unwrap_or(0) > cap
         });
         // The table-wide budget can be paid without shared inputs.
-        let over_budget = self.policy.over_target_budget(&inventory.debt);
+        let over_budget = table_policy.over_target_budget(&inventory.debt);
         if selected.is_empty() && !over_cap && !over_budget
             || !over_budget
                 && before.most.max(before.shared).max(selected.len()) < policy.min_input_files
@@ -641,7 +644,7 @@ impl TableMaintenance {
         writer_config.artifact_tracker = Some(ownership.clone());
         let read_limits = self.read_limits.clone();
         let worker_view = view.clone();
-        let compaction = self.policy.clone();
+        let compaction = table_policy.clone();
         let worker_selected = selected.clone();
         let started = std::time::Instant::now();
         let (output, scanned_rows, merged) = tokio::task::spawn_blocking(move || {

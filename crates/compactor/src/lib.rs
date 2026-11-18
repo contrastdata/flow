@@ -46,7 +46,6 @@ pub enum DeleteDebt {
 pub enum DeleteLayout {
     /// Delete-only consolidation merges its inputs into shared files and data
     /// rewrites keep residual positions in at most eight shared ranges.
-    #[default]
     Shared,
     /// Delete-only consolidation and data-rewrite residuals write one file per
     /// full-size target data file, with exact single-path bounds, and pooled
@@ -54,6 +53,7 @@ pub enum DeleteLayout {
     /// merges a target's existing files by size tier. CDC epochs still write
     /// one shared file. Format v3 tables keep one deletion vector per data file
     /// and use [`DeleteLayout::Shared`]; see [`Policy::for_format_version`].
+    #[default]
     #[serde(alias = "per-target")]
     PerTarget,
 }
@@ -262,7 +262,8 @@ pub struct Policy {
     pub target_delete_files_max: usize,
     /// With [`DeleteLayout::PerTarget`], data files outside L0 at least this
     /// large are full-size: they keep one delete file each. Positions on
-    /// smaller and L0 files share range files; see [`TargetRanges`].
+    /// smaller and L0 files share range files; see [`TargetRanges`]. In a
+    /// smaller table, [`Policy::for_table`] lowers it to a share of the table.
     pub target_delete_min_file_bytes: u64,
     /// Periodic maintenance materializes a table's remaps while more retired
     /// files than this keep one.
@@ -284,6 +285,14 @@ pub struct Policy {
 }
 /// Well below the state store's translation hop limit.
 const MAX_REMAP_DEPTH: u64 = 1024;
+
+/// With [`DeleteLayout::PerTarget`], a file outside L0 holding at least this
+/// fraction (1/n) of a table's bytes outside L0 is full-size. See
+/// [`Policy::for_table`].
+pub const FULL_SIZE_TABLE_SHARE: u64 = 4;
+/// The smallest full-size threshold [`Policy::for_table`] derives. Smaller
+/// files are cheap to rewrite, so their deletes stay pooled.
+pub const FULL_SIZE_FLOOR_BYTES: u64 = 16 << 20;
 
 impl Default for Policy {
     fn default() -> Self {
@@ -314,7 +323,7 @@ impl Default for Policy {
             min_file_age_ms: 1_000,
             lazy_index_remap: true,
             delete_debt: DeleteDebt::Consolidate,
-            delete_layout: DeleteLayout::Shared,
+            delete_layout: DeleteLayout::PerTarget,
             small_file_target_deletes: 8,
             target_delete_files_max: 16,
             target_delete_min_file_bytes: 128 << 20,
@@ -605,6 +614,25 @@ impl Policy {
             && debt.excess_target_delete_files > 0
     }
 
+    /// Whether the L0 files outside `excluded` alone reach a soft L0 limit, so
+    /// that a rewrite of only those files pays L0 debt. A table rewriting
+    /// other inputs in the background uses this to merge newer L0 files
+    /// beside it instead of letting them reach the hard limit.
+    pub fn l0_debt_outside(&self, files: &[FileCandidate], excluded: &BTreeSet<FileId>) -> bool {
+        let (mut count, mut bytes, mut oldest) = (0usize, 0u64, 0u64);
+        for file in files
+            .iter()
+            .filter(|file| file.level == Level::L0 && !excluded.contains(&file.id))
+        {
+            count += 1;
+            bytes = bytes.saturating_add(file.size_bytes);
+            oldest = oldest.max(file.age_ms);
+        }
+        count >= self.l0_soft_files
+            || bytes >= self.l0_soft_bytes
+            || count > 0 && oldest >= self.oldest_l0_soft_ms
+    }
+
     /// Pressure from delete-file count alone: the most delete files applying
     /// to one data file, or the table-wide shared delete-file count. With
     /// [`DeleteLayout::PerTarget`], [`Self::over_target_budget`] is soft.
@@ -657,6 +685,35 @@ impl Policy {
         } else {
             Cow::Borrowed(self)
         }
+    }
+
+    /// The policy for a table of `version` whose live data files are `files`:
+    /// [`Self::for_format_version`], and with [`DeleteLayout::PerTarget`] a
+    /// full-size threshold scaled to the table. A file outside L0 holding at
+    /// least 1/[`FULL_SIZE_TABLE_SHARE`] of the bytes outside L0 is full-size,
+    /// down to [`FULL_SIZE_FLOOR_BYTES`], so a small table dominated by one
+    /// file keeps that file's deletes apart from the L0 ranges every rewrite
+    /// reads. At most that many files qualify this way, and tables of at least
+    /// [`FULL_SIZE_TABLE_SHARE`] times `target_delete_min_file_bytes` are
+    /// unchanged.
+    pub fn for_table(&self, version: FormatVersion, files: &[FileCandidate]) -> Cow<'_, Self> {
+        let policy = self.for_format_version(version);
+        if policy.delete_layout != DeleteLayout::PerTarget {
+            return policy;
+        }
+        let stable = files
+            .iter()
+            .filter(|file| file.level != Level::L0)
+            .fold(0u64, |bytes, file| bytes.saturating_add(file.size_bytes));
+        let threshold = (stable / FULL_SIZE_TABLE_SHARE)
+            .max(FULL_SIZE_FLOOR_BYTES)
+            .min(policy.target_delete_min_file_bytes);
+        if threshold == policy.target_delete_min_file_bytes {
+            return policy;
+        }
+        let mut scaled = policy.into_owned();
+        scaled.target_delete_min_file_bytes = threshold;
+        Cow::Owned(scaled)
     }
 
     /// Whether a delete-only consolidation should pay this debt before any
@@ -747,8 +804,35 @@ impl Policy {
         files: &[FileCandidate],
         deletes: &[DeleteDependency],
     ) -> Result<Option<CompactionPlan>> {
+        self.plan_excluding(
+            base_snapshot_id,
+            schema_id,
+            files,
+            deletes,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// [`Self::plan`], never selecting a data file in `excluded`, such as the
+    /// inputs of a build still running on the same table. Debt still counts
+    /// every file, so an excluded file keeps its pressure until it is retired.
+    pub fn plan_excluding(
+        &self,
+        base_snapshot_id: i64,
+        schema_id: i32,
+        files: &[FileCandidate],
+        deletes: &[DeleteDependency],
+        excluded: &BTreeSet<FileId>,
+    ) -> Result<Option<CompactionPlan>> {
         let count_driven = self.delete_debt == DeleteDebt::Current;
-        let plan = self.plan_with(base_snapshot_id, schema_id, files, deletes, count_driven)?;
+        let plan = self.plan_with(
+            base_snapshot_id,
+            schema_id,
+            files,
+            deletes,
+            count_driven,
+            excluded,
+        )?;
         if plan.is_none()
             && !count_driven
             && self
@@ -757,7 +841,7 @@ impl Policy {
                 .max(self.table_delete_files(deletes))
                 >= self.delete_files_hard
         {
-            return self.plan_with(base_snapshot_id, schema_id, files, deletes, true);
+            return self.plan_with(base_snapshot_id, schema_id, files, deletes, true, excluded);
         }
         Ok(plan)
     }
@@ -929,6 +1013,7 @@ impl Policy {
         files: &[FileCandidate],
         deletes: &[DeleteDependency],
         count_driven: bool,
+        excluded: &BTreeSet<FileId>,
     ) -> Result<Option<CompactionPlan>> {
         let debt = self.debt(files)?;
         let by_id: BTreeMap<_, _> = files.iter().map(|file| (&file.id, file)).collect();
@@ -987,6 +1072,7 @@ impl Policy {
                     DataRewriteScope::All => true,
                 };
                 in_scope
+                    && !excluded.contains(&file.id)
                     && (file.age_ms >= self.min_file_age_ms
                         || debt.pressure == PublicationPressure::Pause)
                     && match file.level {
@@ -1030,6 +1116,13 @@ impl Policy {
         });
         let mut budget_blocked = false;
         for seed in &eligible {
+            // Hard L0 debt sorts L0 seeds first, and only an L0 rewrite lowers
+            // it. When every L0 group exceeds the delete input budget, report
+            // that, so a bounded dependency repair can localize their deletes,
+            // instead of a group of other files that leaves publication paused.
+            if hard_l0_debt && budget_blocked && seed.level != Level::L0 {
+                break;
+            }
             let output_level = if seed.level == Level::L0 {
                 Level::L1
             } else {

@@ -7,8 +7,8 @@ mod builds;
 mod concurrent;
 pub use builds::{BuildRegistration, active_build_protection, discard_abandoned_builds};
 pub use concurrent::{
-    PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
-    RunningCompaction, RunningCompactionPreparation,
+    BuildScope, PreparationWait, PreparedCompaction, ReadyCompaction,
+    RetiringCompactionPreparation, RunningCompaction, RunningCompactionPreparation,
 };
 mod garbage;
 pub use garbage::{GarbagePolicy, GarbageProtection, GarbageReport};
@@ -441,7 +441,7 @@ impl TableMaintenance {
             .len();
         let policy = self
             .policy
-            .for_format_version(table.metadata().format_version());
+            .for_table(table.metadata().format_version(), &files);
         let per_target = policy.delete_layout == flow_compactor::DeleteLayout::PerTarget;
         let legacy_delete_count = view
             .live_files
@@ -500,7 +500,7 @@ impl TableMaintenance {
         let inventory = self.inventory(&table, table_id).await?;
         let Some(mut plan) = self
             .policy
-            .for_format_version(table.metadata().format_version())
+            .for_table(table.metadata().format_version(), &inventory.files)
             .plan(
                 snapshot,
                 table.metadata().current_schema_id(),

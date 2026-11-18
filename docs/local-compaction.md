@@ -83,7 +83,10 @@ work retain their existing paths.
 The daemon admits up to two local builds within the configured table worker
 budget, leaving at least one worker for table actors and keeping each reservation
 through finalization. With only one table worker, it uses the strict path.
-Library callers must serialize one build per table.
+Library callers register builds on the serialized table actor. A table holds at
+most two BUILD records, and a second build must not select the first's inputs
+(`BuildScope`).
+
 A completed build receives a short table boundary for background handoff, then a
 prepared candidate receives the next boundary for activation. Prepared work is
 preferred over a new CDC epoch; build handoff is preferred next so sustained CDC
@@ -94,6 +97,28 @@ hard debt. The build wait requests cancellation after 30 seconds and still joins
 the actual worker before releasing ownership. Catch-up accepts at most 256
 intervening snapshots and applies the configured delete-input file, byte and row
 limits before staging. The Parquet read/write admission limits also apply.
+
+### Side builds beside a long rewrite
+
+A table's main lane runs any background build. Rewriting a large table can take
+several seconds, while CDC adds an L0 file per epoch; if those files reached
+the hard L0 limit, publication would pause until the build finished and a
+synchronous rewrite cleared them. So while a main build's worker runs, the
+table's side lane may capture a second build over only the L0 files the main
+build did not select, once those alone reach a soft L0 limit. It is admitted
+like a probe when the table's maintenance is due, or at once if hard pressure
+is already waiting for the main build. Both lanes share the build budget, and
+no main build starts while a side build holds its lane.
+
+Either build may activate first. The other's catch-up then sees an
+intervening rewrite of files it did not select: its own inputs are unchanged,
+and any position-delete file the rewrite replaced goes through the same
+retention proof as a delete consolidation. A table runs one preparation and
+activation at a time; a completed build of the other lane waits for that
+pipeline. BUILD records are keyed by table and operation
+(`active-build/v2/<table-uuid>/<operation>`). Startup still discards the
+earlier per-table records; a release before side builds cannot open a state
+directory that retains a v2 record and reports an unsupported record version.
 
 After one second of deferral, an eligible soft data-build probe may precede
 another ready CDC epoch. This does not guarantee admission of soft delete
@@ -277,11 +302,18 @@ depend on that rewrite retiring sparse vectors.
 
 ## Per-target delete layout
 
-With `[compaction] delete_layout = "per_target"` (default `"shared"`), format
-v2 tables keep rewritten position deletes on each full-size data file in one
-file per data file, whose equal lower and upper `file_path` bounds name it.
+With `[compaction] delete_layout = "per_target"`, the default, format v2
+tables keep rewritten position deletes on each full-size data file in one file
+per data file, whose equal lower and upper `file_path` bounds name it.
+`"shared"` keeps the earlier shared files.
 A data file is full-size outside L0 at `target_delete_min_file_bytes`
-(128 MiB, like `l1_target_bytes`) or more. Positions on L0 and smaller files
+(128 MiB, like `l1_target_bytes`) or more. In a table with less than four times
+that outside L0, a file holding at least a quarter of those bytes is also
+full-size, down to 16 MiB: a small table dominated by one base file keeps that
+file's deletes apart from the pooled L0 ranges every rewrite reads. At most
+four files qualify this way, and the threshold moves with the table, so a file
+that falls below it is a small file whose single-target files a data rewrite
+pays, as below. Positions on L0 and smaller files
 are pooled into shared range files, as with the shared layout, ending before
 any full-size file between their targets by path. Those files are rewritten
 soon, and that rewrite or the next consolidation consumes the range, whereas
@@ -392,6 +424,12 @@ The planner tries feasible subsets without increasing data or delete read budget
 Position-delete files carry exact full-path bounds, and a data rewrite emits at
 most eight ordered residual ranges. This avoids charging a single broad residual
 to every older data file when narrower metadata can exclude it.
+
+Under hard L0 debt, L0 groups come first and only they lower the pause. When
+every L0 group exceeds the delete budget, planning reports that instead of
+selecting other files, such as a small-file group, that would spend the paused
+publication without lowering its debt. An update-heavy benchmark spent 4.3 s of
+a 10.8 s pause merging 657k rows of unrelated small files this way.
 
 When no useful data group fits, a repair pass reads one individually admissible
 shared delete file and counts its effective positions using disk-backed staging.

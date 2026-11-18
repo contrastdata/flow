@@ -23,9 +23,9 @@ pub use artifacts::{import_catalog_metadata, register_catalog_metadata};
 pub use layout::{Overlap, SortLayout, sort_layout};
 pub use ledger::{AckMode, JournalDurability, SourceLedger, Watermarks};
 pub use maintenance::{
-    BuildRegistration, CatchUpStats, DeleteRepairCursor, DeleteRewritePolicy, ExternalMutation,
-    GarbagePolicy, GarbageProtection, GarbageReport, HistoryPlan, HistoryPolicy, Inventory,
-    PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
+    BuildRegistration, BuildScope, CatchUpStats, DeleteRepairCursor, DeleteRewritePolicy,
+    ExternalMutation, GarbagePolicy, GarbageProtection, GarbageReport, HistoryPlan, HistoryPolicy,
+    Inventory, PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
     RunningCompaction, RunningCompactionPreparation, TableMaintenance, active_build_protection,
     discard_abandoned_builds,
 };

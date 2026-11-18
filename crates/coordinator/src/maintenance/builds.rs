@@ -14,8 +14,19 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 const ROOT_PREFIX: &[u8] = b"active-build/";
-const PREFIX: &str = "active-build/v1/";
+/// One record per table, written before a table could hold two builds.
+/// Startup still discards these; nothing writes them.
+const LEGACY_PREFIX: &str = "active-build/v1/";
+/// One record per build, keyed by table UUID and operation.
+const PREFIX: &str = "active-build/v2/";
 const MAX_RECORD_BYTES: u64 = 16 << 10;
+/// A table runs at most one build over its whole layout and one more over
+/// L0 files that the first did not select. See `BuildScope`.
+const MAX_TABLE_BUILDS: usize = 2;
+
+fn table_prefix(table_uuid: uuid::Uuid) -> String {
+    format!("{PREFIX}{table_uuid}/")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveBuild {
@@ -28,7 +39,11 @@ struct ActiveBuild {
 
 impl ActiveBuild {
     fn key(&self) -> Vec<u8> {
-        format!("{PREFIX}{}", self.table_uuid).into_bytes()
+        format!("{}{}", table_prefix(self.table_uuid), self.operation.0).into_bytes()
+    }
+
+    fn legacy_key(&self) -> Vec<u8> {
+        format!("{LEGACY_PREFIX}{}", self.table_uuid).into_bytes()
     }
 
     fn validate(&self) -> Result<()> {
@@ -55,7 +70,7 @@ impl ActiveBuild {
 
     fn decode(key: &[u8], bytes: &[u8]) -> Result<Self> {
         ensure!(
-            key.starts_with(PREFIX.as_bytes()),
+            key.starts_with(PREFIX.as_bytes()) || key.starts_with(LEGACY_PREFIX.as_bytes()),
             "unsupported compaction build record version"
         );
         ensure!(
@@ -68,7 +83,10 @@ impl ActiveBuild {
             .reject_trailing_bytes()
             .deserialize(bytes)?;
         record.validate()?;
-        ensure!(record.key() == key, "compaction build record key mismatch");
+        ensure!(
+            record.key() == key || record.legacy_key() == key,
+            "compaction build record key mismatch"
+        );
         Ok(record)
     }
 }
@@ -119,10 +137,25 @@ impl BuildRegistration {
         let key = record.key();
         let value = bincode::serialize(&record)?;
         let saved_store = store.clone();
+        let table_prefix = table_prefix(record.table_uuid).into_bytes();
+        let legacy = record.legacy_key();
         blocking(move || {
             ensure!(
-                saved_store.source_transaction(&key)?.is_none(),
-                "table already has an active compaction build"
+                saved_store.source_transaction(&legacy)?.is_none(),
+                "table has a compaction build from an earlier release"
+            );
+            let mut active = 0usize;
+            for entry in saved_store.source_transactions_after(&table_prefix, None) {
+                let (existing, _) = entry?;
+                ensure!(
+                    *existing != *key,
+                    "compaction build operation already exists"
+                );
+                active += 1;
+            }
+            ensure!(
+                active < MAX_TABLE_BUILDS,
+                "table already has {MAX_TABLE_BUILDS} active compaction builds"
             );
             ensure!(
                 saved_store.operation(&operation)?.is_none(),
@@ -240,34 +273,47 @@ impl BuildRegistration {
     }
 }
 
-/// Include the build's base and every retained descendant in maintenance
+/// Include every build's base and each retained descendant in maintenance
 /// protection. Keeping the intervening ancestry is required for catch-up proof.
 pub fn active_build_protection(
     store: &StateStore,
     table: &Table,
     table_id: TableId,
 ) -> Result<GarbageProtection> {
-    let key = format!("{PREFIX}{}", table.metadata().uuid()).into_bytes();
-    let Some(bytes) = store.source_transaction(&key)? else {
-        return Ok(GarbageProtection::default());
-    };
-    let record = ActiveBuild::decode(&key, &bytes)?;
-    record.validate_table(table, table_id)?;
-    let base = table
-        .metadata()
-        .snapshot_by_id(record.base_snapshot_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("active compaction build base snapshot is no longer retained")
-        })?;
+    let uuid = table.metadata().uuid();
+    let mut records = Vec::new();
+    let legacy = format!("{LEGACY_PREFIX}{uuid}").into_bytes();
+    if let Some(bytes) = store.source_transaction(&legacy)? {
+        records.push(ActiveBuild::decode(&legacy, &bytes)?);
+    }
+    for entry in store.source_transactions_after(table_prefix(uuid).as_bytes(), None) {
+        let (key, bytes) = entry?;
+        records.push(ActiveBuild::decode(&key, &bytes)?);
+    }
     let mut protection = GarbageProtection::default();
-    protection.operations.insert(record.operation);
-    protection.snapshots.extend(
-        table
+    let mut oldest = None;
+    for record in records {
+        record.validate_table(table, table_id)?;
+        let base = table
             .metadata()
-            .snapshots()
-            .filter(|snapshot| snapshot.sequence_number() >= base.sequence_number())
-            .map(|snapshot| snapshot.snapshot_id()),
-    );
+            .snapshot_by_id(record.base_snapshot_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("active compaction build base snapshot is no longer retained")
+            })?;
+        protection.operations.insert(record.operation);
+        oldest = Some(oldest.map_or(base.sequence_number(), |oldest: i64| {
+            oldest.min(base.sequence_number())
+        }));
+    }
+    if let Some(oldest) = oldest {
+        protection.snapshots.extend(
+            table
+                .metadata()
+                .snapshots()
+                .filter(|snapshot| snapshot.sequence_number() >= oldest)
+                .map(|snapshot| snapshot.snapshot_id()),
+        );
+    }
     Ok(protection)
 }
 

@@ -66,10 +66,11 @@ async fn unfenced_build_protects_ancestry_and_uploads_through_index_loss_until_s
             f.index.clone(),
             &f.head,
             f.schema.table_id,
-            OperationId("duplicate-build".into()),
+            OperationId("speculative-build".into()),
         )
         .await
-        .is_err()
+        .is_err(),
+        "an operation owns one build"
     );
     let path = output(&f, &build).await;
     assert!(f.index.pending_operations().unwrap().is_empty());
@@ -251,4 +252,104 @@ async fn prepared_publication_takes_over_build_protection_and_survives_startup_c
         assert!(f.head.file_io().exists(&path).await.unwrap());
         assert_eq!(sorted(scan(&f.head, &f.schema).await.unwrap()), f.expected);
     }
+}
+
+/// A table may hold a second build, such as an L0 build beside a long rewrite,
+/// but no third, and one operation owns one build. Protection covers every
+/// build from the oldest base on, and retiring one keeps the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_table_holds_two_builds_and_protects_both() {
+    let f = Fixture::new().await;
+    let base = f.head.metadata().current_snapshot_id().unwrap();
+    let main = BuildRegistration::begin(
+        f.index.clone(),
+        &f.head,
+        f.schema.table_id,
+        OperationId("main-build".into()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        BuildRegistration::begin(
+            f.index.clone(),
+            &f.head,
+            f.schema.table_id,
+            OperationId("main-build".into()),
+        )
+        .await
+        .is_err(),
+        "an operation owns one build"
+    );
+    let publisher = TablePublisher::new(
+        f.index.clone(),
+        f.catalog.clone(),
+        WriterConfig::default(),
+        2,
+        1 << 20,
+    )
+    .unwrap();
+    let (epoch, collapsed) = flow_testkit::collapse_fixture(
+        &f.index,
+        &f.head,
+        &f.schema,
+        SourceId("fixture".into()),
+        PgLsn(90),
+        [(f.schema.encode_key(&row(3)).unwrap(), Change::Delete)],
+    );
+    publisher
+        .publish(&f.head, &f.schema, collapsed)
+        .await
+        .unwrap();
+    f.index.forget_applied(&epoch.id).unwrap();
+    let head = f.catalog.load_table(f.head.identifier()).await.unwrap();
+    let newer = head.metadata().current_snapshot_id().unwrap();
+    let side = BuildRegistration::begin(
+        f.index.clone(),
+        &head,
+        f.schema.table_id,
+        OperationId("side-build".into()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        BuildRegistration::begin(
+            f.index.clone(),
+            &head,
+            f.schema.table_id,
+            OperationId("third-build".into()),
+        )
+        .await
+        .is_err()
+    );
+    let protection = active_build_protection(&f.index, &head, f.schema.table_id).unwrap();
+    assert!(protection.snapshots.contains(&base) && protection.snapshots.contains(&newer));
+    assert_eq!(
+        protection.operations,
+        BTreeSet::from([main.operation_id().clone(), side.operation_id().clone()])
+    );
+    // Retiring the older build leaves only the newer base's ancestry.
+    main.release_after_join().await.unwrap();
+    let protection = active_build_protection(&f.index, &head, f.schema.table_id).unwrap();
+    assert!(!protection.snapshots.contains(&base) && protection.snapshots.contains(&newer));
+    assert_eq!(
+        protection.operations,
+        BTreeSet::from([side.operation_id().clone()])
+    );
+    // A slot is free again; startup discards every remaining record.
+    let again = BuildRegistration::begin(
+        f.index.clone(),
+        &head,
+        f.schema.table_id,
+        OperationId("next-build".into()),
+    )
+    .await
+    .unwrap();
+    drop(again);
+    assert_eq!(discard_abandoned_builds(&f.index).unwrap(), 2);
+    assert!(
+        active_build_protection(&f.index, &head, f.schema.table_id)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
 }

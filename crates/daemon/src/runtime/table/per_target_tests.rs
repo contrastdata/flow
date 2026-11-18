@@ -69,6 +69,14 @@ fn value(id: i64, version: u64) -> Vec<Value> {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_layout(flow_compactor::DeleteLayout::PerTarget, 8, 16).await
+    }
+
+    async fn with_layout(
+        delete_layout: flow_compactor::DeleteLayout,
+        l0_soft_files: usize,
+        l0_hard_files: usize,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut config: Config =
             toml::from_str(include_str!("../../../../../examples/flow.toml")).unwrap();
@@ -169,11 +177,11 @@ impl Harness {
         store.forget_applied(&seed).unwrap();
         let head = committed.table;
         config.compaction = flow_compactor::Policy {
-            delete_layout: flow_compactor::DeleteLayout::PerTarget,
+            delete_layout,
             min_file_age_ms: 0,
             // L0 debt by count alone, as the daemon's age limits would.
-            l0_soft_files: 8,
-            l0_hard_files: 16,
+            l0_soft_files,
+            l0_hard_files,
             stable_small_soft_files: 24,
             oldest_l0_soft_ms: 600_000,
             oldest_l0_hard_ms: 1_200_000,
@@ -321,24 +329,48 @@ impl Harness {
         build_admission: BuildAdmission,
         candidate: Option<CompactionCandidate>,
     ) -> TableOutcome {
-        self.work
+        self.visit_lane(
+            transactions,
+            build_admission,
+            candidate,
+            BuildLane::Main,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn visit_lane(
+        &self,
+        transactions: Vec<SourceTransaction>,
+        build_admission: BuildAdmission,
+        candidate: Option<CompactionCandidate>,
+        lane: BuildLane,
+        build_active: bool,
+        side_scope: Option<BuildScope>,
+    ) -> TableOutcome {
+        let completion = self
+            .work
             .clone()
             .run(
                 self.schema.clone(),
                 transactions,
                 WorkOptions {
                     periodic_maintenance: false,
-                    build_active: false,
+                    build_active,
                     build_admission,
+                    lane,
                     actor_acquired_at: Instant::now(),
                 },
                 candidate,
                 None,
                 PrefoldLink::default(),
+                side_scope,
             )
             .await
-            .unwrap()
-            .outcome
+            .unwrap();
+        assert_eq!(completion.lane, lane);
+        completion.outcome
     }
 
     /// Finish a background build as the runtime does: join the worker, hand
@@ -385,6 +417,101 @@ impl Harness {
             TableOutcome::CandidateInvalidated => {}
             _ => panic!("unexpected activation outcome"),
         }
+    }
+
+    /// [`Self::finish`] for a build in `lane`; returns whether it committed.
+    async fn finish_lane(&mut self, build: StartedBuild, lane: BuildLane) -> bool {
+        let StartedBuild {
+            running,
+            path,
+            started,
+        } = build;
+        let ready = running.wait().await.unwrap();
+        let candidate = CompactionCandidate::Built(CompletedBuild {
+            ready,
+            path,
+            started,
+        });
+        let TableOutcome::Preparation(preparation) = self
+            .visit_lane(
+                Vec::new(),
+                BuildAdmission::Fenced,
+                Some(candidate),
+                lane,
+                false,
+                None,
+            )
+            .await
+        else {
+            panic!("a completed build hands off preparation");
+        };
+        let StartedPreparation {
+            running,
+            path,
+            started,
+            activation_stall_started,
+        } = *preparation;
+        let prepared = running.wait().await.unwrap();
+        let candidate = CompactionCandidate::Prepared(CompletedPreparation {
+            prepared,
+            path,
+            started,
+            activation_stall_started,
+        });
+        match self
+            .visit_lane(
+                Vec::new(),
+                BuildAdmission::Fenced,
+                Some(candidate),
+                lane,
+                false,
+                None,
+            )
+            .await
+        {
+            TableOutcome::Complete { snapshot, .. } => snapshot.is_some(),
+            TableOutcome::CandidateInvalidated => false,
+            _ => panic!("unexpected activation outcome"),
+        }
+    }
+
+    /// One CDC epoch while a build runs, as the runtime dispatches it.
+    async fn epoch_beside_build(&mut self, epoch: u64) {
+        let transaction = self.transaction(epoch);
+        let outcome = self
+            .visit_lane(
+                vec![transaction],
+                BuildAdmission::Wait,
+                None,
+                BuildLane::Main,
+                true,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                TableOutcome::Complete {
+                    operation: Some(_),
+                    ..
+                }
+            ),
+            "the epoch publishes beside the build"
+        );
+    }
+
+    async fn l0_files(&self) -> std::collections::BTreeSet<FileId> {
+        let head = self.head().await;
+        self.work
+            .maintenance
+            .inventory(&head, self.schema.table_id)
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|file| file.level == flow_compactor::Level::L0)
+            .map(|file| file.id)
+            .collect()
     }
 
     /// One CDC epoch. Returns whether it left data maintenance pending.
@@ -576,4 +703,103 @@ async fn per_target_delete_files_stay_bounded_through_daemon_maintenance() {
         stats.activations * 4 >= stats.history.len() * 3,
         "{stats:?}"
     );
+}
+
+/// While a background build rewrites older L0 files, a side build merges the
+/// newer ones that CDC keeps adding. Whichever activates first, the other
+/// still catches up across that rewrite and commits: neither selected the
+/// other's inputs, and catch-up proves that every replaced delete file keeps
+/// the base deletes on its own inputs. Rows and the index stay exact, and no
+/// build ownership remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_side_build_merges_new_l0_files_beside_a_running_build() {
+    use flow_compactor::DeleteLayout::{PerTarget, Shared};
+    for (layout, side_first) in [(Shared, true), (Shared, false), (PerTarget, true)] {
+        let mut harness = Harness::with_layout(layout, 4, 64).await;
+        let mut epoch = 0;
+        for _ in 0..4 {
+            epoch += 1;
+            harness.epoch(epoch).await;
+        }
+        let TableOutcome::Build(main) =
+            harness.visit(Vec::new(), BuildAdmission::Start, None).await
+        else {
+            panic!("soft L0 debt starts a background build");
+        };
+        let main_inputs = main.running.input_files().clone();
+        let scope = BuildScope {
+            exclude: main_inputs.clone(),
+            l0_only: true,
+        };
+        // Too few new L0 files outside the running build: the side declines.
+        epoch += 1;
+        harness.epoch_beside_build(epoch).await;
+        assert!(matches!(
+            harness
+                .visit_lane(
+                    Vec::new(),
+                    BuildAdmission::Side,
+                    None,
+                    BuildLane::Side,
+                    false,
+                    Some(scope.clone()),
+                )
+                .await,
+            TableOutcome::ProbeComplete
+        ));
+        for _ in 0..4 {
+            epoch += 1;
+            harness.epoch_beside_build(epoch).await;
+        }
+        let TableOutcome::Build(side) = harness
+            .visit_lane(
+                Vec::new(),
+                BuildAdmission::Side,
+                None,
+                BuildLane::Side,
+                false,
+                Some(scope),
+            )
+            .await
+        else {
+            panic!("new L0 debt beside the running build starts a side build");
+        };
+        let side_inputs = side.running.input_files().clone();
+        assert!(!side_inputs.is_empty() && side_inputs.is_disjoint(&main_inputs));
+        let l0 = harness.l0_files().await;
+        assert!(side_inputs.is_subset(&l0) && main_inputs.is_subset(&l0));
+        for _ in 0..3 {
+            epoch += 1;
+            harness.epoch_beside_build(epoch).await;
+        }
+        let (first, second) = if side_first {
+            ((side, BuildLane::Side), (main, BuildLane::Main))
+        } else {
+            ((main, BuildLane::Main), (side, BuildLane::Side))
+        };
+        assert!(harness.finish_lane(*first.0, first.1).await, "{layout:?}");
+        for _ in 0..2 {
+            epoch += 1;
+            harness.epoch_beside_build(epoch).await;
+        }
+        assert!(
+            harness.finish_lane(*second.0, second.1).await,
+            "{layout:?}: the other build survives the first rewrite"
+        );
+        let l0 = harness.l0_files().await;
+        assert!(l0.is_disjoint(&main_inputs) && l0.is_disjoint(&side_inputs));
+        assert!(
+            harness
+                .work
+                .store
+                .source_transactions_after(b"active-build/", None)
+                .next()
+                .is_none()
+        );
+        harness.check().await;
+        // CDC continues on the rewritten layout.
+        epoch += 1;
+        harness.epoch(epoch).await;
+        harness.check().await;
+    }
 }

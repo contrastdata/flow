@@ -831,6 +831,7 @@ fn format_v3_tables_pay_delete_file_count_with_a_data_rewrite() {
             "{:?}",
             Policy {
                 delete_debt: DeleteDebt::Current,
+                delete_layout: DeleteLayout::Shared,
                 ..Policy::default()
             }
         )
@@ -976,6 +977,7 @@ fn per_target_merges_respect_the_remaining_budget_most_files_first() {
 fn per_target_layout_charges_only_shared_dependencies_table_wide() {
     let shared = Policy {
         min_file_age_ms: 0,
+        delete_layout: DeleteLayout::Shared,
         ..Policy::default()
     };
     let per_target = Policy {
@@ -1298,5 +1300,119 @@ fn per_target_pools_l0_and_small_targets_between_full_size_files() {
     assert_eq!(
         shared.plan(1, 0, &l0, &[]).unwrap().unwrap().target_ranges,
         TargetRanges::default()
+    );
+}
+
+#[test]
+fn hard_l0_debt_blocked_by_its_deletes_asks_for_repair_not_other_files() {
+    // Publication is paused on L0 age. The old L0 files share a delete file
+    // over the row budget, while six small stable files form an unrelated
+    // small-file group that would leave publication paused.
+    let policy = Policy::default();
+    let mut files = (0..2)
+        .map(|id| {
+            let mut l0 = file(id, 1 << 20);
+            l0.age_ms = policy.oldest_l0_hard_ms;
+            l0
+        })
+        .collect::<Vec<_>>();
+    files.extend((2..8).map(|id| {
+        let mut stable = file(id, 4 << 20);
+        stable.level = Level::L2;
+        stable.age_ms = 60_000;
+        stable
+    }));
+    let debt = policy.debt(&files).unwrap();
+    assert_eq!(debt.pressure, PublicationPressure::Pause);
+    assert_eq!(policy.pressure_reasons(&debt), vec!["oldest_l0"]);
+    let shared = DeleteDependency {
+        id: FileId("shared-delete".into()),
+        size_bytes: 1 << 20,
+        row_count: policy.max_delete_input_rows + 1,
+        targets: files[..2].iter().map(|file| file.id.clone()).collect(),
+    };
+    assert_eq!(
+        policy.plan(1, 0, &files, std::slice::from_ref(&shared)),
+        Err(Error::DependencyBudget)
+    );
+    // Within the budget, the same debt selects the L0 files.
+    let fits = DeleteDependency {
+        row_count: policy.max_delete_input_rows,
+        ..shared.clone()
+    };
+    let plan = policy.plan(1, 0, &files, &[fits]).unwrap().unwrap();
+    assert_eq!(
+        plan.input_files,
+        files[..2].iter().map(|file| file.id.clone()).collect()
+    );
+    // Without hard L0 debt, other work still runs beside a blocked L0 group.
+    for l0 in &mut files[..2] {
+        l0.age_ms = policy.oldest_l0_soft_ms;
+    }
+    let plan = policy.plan(1, 0, &files, &[shared]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::SmallFiles);
+}
+
+#[test]
+fn per_target_full_size_threshold_scales_down_to_a_quarter_of_a_small_table() {
+    use flow_compactor::{FULL_SIZE_FLOOR_BYTES, FULL_SIZE_TABLE_SHARE};
+    use iceberg::spec::FormatVersion;
+    let per_target = Policy::default();
+    assert_eq!(per_target.delete_layout, DeleteLayout::PerTarget);
+    let stable = |id, bytes| {
+        let mut file = file(id, bytes);
+        file.level = Level::L2;
+        file
+    };
+    // A 43 MiB base file, two small files and L0 output, which is not counted.
+    let mut files = vec![
+        stable(0, 43 << 20),
+        stable(1, 4 << 20),
+        stable(2, 3 << 20),
+        file(3, 64 << 20),
+    ];
+    let scaled = per_target.for_table(FormatVersion::V2, &files);
+    assert_eq!(scaled.target_delete_min_file_bytes, FULL_SIZE_FLOOR_BYTES);
+    assert!(scaled.full_size_target(&files[0]));
+    assert!(!scaled.full_size_target(&files[1]) && !scaled.full_size_target(&files[3]));
+    // Above the floor the threshold is a share of the bytes outside L0.
+    files.push(stable(4, 150 << 20));
+    let scaled = per_target.for_table(FormatVersion::V2, &files);
+    assert_eq!(
+        scaled.target_delete_min_file_bytes,
+        (200 << 20) / FULL_SIZE_TABLE_SHARE
+    );
+    assert!(scaled.full_size_target(&files[4]) && !scaled.full_size_target(&files[0]));
+    // A large table keeps the configured threshold, as do shared and v3 layouts.
+    files.push(stable(5, 1 << 30));
+    assert_eq!(
+        per_target
+            .for_table(FormatVersion::V2, &files)
+            .target_delete_min_file_bytes,
+        per_target.target_delete_min_file_bytes
+    );
+    files.truncate(3);
+    let shared = Policy {
+        delete_layout: DeleteLayout::Shared,
+        ..Policy::default()
+    };
+    for policy in [
+        shared.for_table(FormatVersion::V2, &files),
+        per_target.for_table(FormatVersion::V3, &files),
+    ] {
+        assert_eq!(
+            policy.target_delete_min_file_bytes,
+            per_target.target_delete_min_file_bytes
+        );
+    }
+    // A configured threshold below the floor is never raised.
+    let low = Policy {
+        target_delete_min_file_bytes: 1 << 20,
+        ..per_target.clone()
+    };
+    assert_eq!(
+        low.for_table(FormatVersion::V2, &files)
+            .target_delete_min_file_bytes,
+        1 << 20
     );
 }
