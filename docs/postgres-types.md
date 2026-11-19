@@ -130,7 +130,7 @@ stored generated values after base-column updates. CI runs it on PostgreSQL
 ```sh
 uv run tests/production/type_compat.py \
   --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
-  --binary target/debug/embrasure-flow --artifacts /tmp/flow-type-check
+  --binary target/debug/contrast-flow --artifacts /tmp/flow-type-check
 ```
 
 Use the disposable services and environment variables from the

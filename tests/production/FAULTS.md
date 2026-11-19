@@ -11,7 +11,7 @@ uv run tests/production/faults.py \
   --s3-endpoint http://127.0.0.1:59000 \
   --compose-project flow-production-local \
   --compose-env-file target/production-local/ports.env \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --compactor-binary target/release/examples/local_compactor \
   --artifacts target/production-faults-01
 ```
@@ -49,7 +49,7 @@ After each kill, the harness compares the slot's `confirmed_flush_lsn` with the 
 ```sh
 uv run tests/production/crash_loop.py --duration 240 \
   --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/debug/embrasure-flow --artifacts target/crash-loop-01
+  --binary target/debug/contrast-flow --artifacts target/crash-loop-01
 ```
 
 The seed is printed first and recorded with a reproduction command in `report.json`; pass `--seed` to replay the same fault, timing and workload decisions (thread scheduling still varies). CI runs a four-minute loop on every change. `.github/workflows/nightly.yml` runs a one-hour loop (`--duration 3600`) and `soak.py`, which runs the same workload for 30 minutes without faults, samples daemon RSS, state directory and journal bytes and table metadata size, and fails when a resource's medians grow across three post-warm-up windows beyond a tolerance. The soak shortens snapshot retention and orphan grace to two minutes so that metadata and artifact bookkeeping can reach steady state.
@@ -69,7 +69,7 @@ uv run tests/production/contracts.py \
   --postgres-url "$FLOW_POSTGRES_URL" \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/debug/embrasure-flow \
+  --binary target/debug/contrast-flow \
   --artifacts target/production-contracts-01
 ```
 
@@ -98,7 +98,7 @@ version, and removes only those generated containers and their volumes.
 python3 tests/production/source_versions.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --artifacts target/production-source-versions-01
 ```
 

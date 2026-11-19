@@ -23,7 +23,7 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     let path = temp.path().join("flow.toml");
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+        Command::new(env!("CARGO_BIN_EXE_contrast-flow"))
             .args(["--config", path.to_str().unwrap(), "init"])
             .env_remove("FLOW_INIT_TEST_MISSING_CONNECTION")
             .output()
@@ -54,7 +54,7 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
         status["last_error"]["message"],
         "source connection environment variable is missing: FLOW_INIT_TEST_MISSING_CONNECTION"
     );
-    let status_command = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+    let status_command = Command::new(env!("CARGO_BIN_EXE_contrast-flow"))
         .args(["--config", path.to_str().unwrap(), "status"])
         .output()
         .unwrap();
@@ -62,7 +62,7 @@ fn failed_init_exports_process_metrics_without_hiding_the_primary_error() {
     assert_eq!(status_command.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&status_command.stdout).contains("\"last_error\""));
     // A filter that disables the fatal event still reports the error.
-    let filtered = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+    let filtered = Command::new(env!("CARGO_BIN_EXE_contrast-flow"))
         .args(["--config", path.to_str().unwrap(), "init"])
         .env_remove("FLOW_INIT_TEST_MISSING_CONNECTION")
         .env("RUST_LOG", "flow_events=debug")

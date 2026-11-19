@@ -1,6 +1,6 @@
 [package]
 name = "flow-catalog-watch"
-description = "External Iceberg snapshot reconciliation for Embrasure Flow"
+description = "External Iceberg snapshot reconciliation for Contrast Flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

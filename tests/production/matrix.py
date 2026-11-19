@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--postgres-url", default=os.environ.get("FLOW_POSTGRES_URL"))
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
-    parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/release/contrast-flow"))
     parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--compactor-binary", type=Path)
     parser.add_argument("--reader-baseline-compactor", type=Path)

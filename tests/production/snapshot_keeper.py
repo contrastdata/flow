@@ -57,7 +57,7 @@ class KeeperRun(Run):
         # The test owns these source tables. Worker transactions have committed;
         # only their exporting keeper still holds this read-only snapshot/lock.
         keepers = self.pg.execute("""SELECT a.pid FROM pg_stat_activity a
-            WHERE a.application_name = 'embrasure-flow' AND a.state = 'idle in transaction'
+            WHERE a.application_name = 'contrast-flow' AND a.state = 'idle in transaction'
               AND a.query = 'SELECT pg_catalog.pg_export_snapshot()'
               AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid
                   AND l.relation = 'orders'::regclass AND l.mode = 'AccessShareLock')""").fetchall()
@@ -123,7 +123,7 @@ def main():
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
-    parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/debug/contrast-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--supervised-worker", action="store_true", help=argparse.SUPPRESS)

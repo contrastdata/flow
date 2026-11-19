@@ -42,7 +42,7 @@ and its `AWS_*` and `FLOW_POSTGRES_URL` variables exported:
 uv run tests/local/default_identity.py \
   --catalog-uri "http://$(docker compose -f tests/local/compose.yaml port rest 8181)" \
   --s3-endpoint "http://$(docker compose -f tests/local/compose.yaml port minio 9000)" \
-  --binary target/debug/embrasure-flow --artifacts /tmp/new-default-identity-run
+  --binary target/debug/contrast-flow --artifacts /tmp/new-default-identity-run
 ```
 
 It creates `run/` and `identity-change/` below the artifact directory, which

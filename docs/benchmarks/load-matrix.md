@@ -121,7 +121,7 @@ Freeze a release build and start the disposable services as described in the
 ```sh
 python3 tests/production/matrix.py \
   --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --build-manifest target/qualification-binaries/current/build-manifest.json \
   --reader-baseline-compactor target/qualification-binaries/current/local_compactor \
   --duration 60 --warmup 10 --artifacts target/expanded-matrix \

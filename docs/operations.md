@@ -13,7 +13,7 @@ Run the connected preflight with the same configuration and environment as
 the daemon:
 
 ```sh
-embrasure-flow --config flow.toml check --source
+contrast-flow --config flow.toml check --source
 ```
 
 It is read-only. It checks the server version and `wal_level`, free replication
@@ -74,7 +74,7 @@ startup errors exit immediately.
 
 ```ini
 [Unit]
-Description=Embrasure Flow
+Description=Contrast Flow
 Wants=network-online.target
 After=network-online.target
 
@@ -82,7 +82,7 @@ After=network-online.target
 User=flow
 Environment=FLOW_POSTGRES_URL=...
 # Or EnvironmentFile=/etc/flow/env with mode 0600.
-ExecStart=/usr/local/bin/embrasure-flow --config /etc/flow/flow.toml run
+ExecStart=/usr/local/bin/contrast-flow --config /etc/flow/flow.toml run
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=78 79

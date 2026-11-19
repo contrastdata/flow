@@ -324,10 +324,10 @@ PostgreSQL with `wal_level=logical`, MinIO and the Iceberg REST fixture), then:
 
 ```sh
 uv run tests/production/durability_bench.py --label remote-01 \
-  --root runs --binary target/release/embrasure-flow \
+  --root runs --binary target/release/contrast-flow \
   --durability remote --s3-latency-ms 30 --seconds 45 --tps 5 --seed-rows 10000
 uv run tests/production/durability_bench.py --label backlog-loss \
-  --root runs --binary target/release/embrasure-flow --durability remote \
+  --root runs --binary target/release/contrast-flow --durability remote \
   --ack-mode journaled --fault disk-loss-backlog --tables 2 --tps 4 --adversarial
 ```
 

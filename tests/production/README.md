@@ -122,7 +122,7 @@ export FLOW_POSTGRES_URL='postgres://flow:local-test-password@127.0.0.1:55432/fl
 uv run tests/production/benchmark.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --build-manifest target/qualification-binaries/current/build-manifest.json \
   --compactor-binary target/qualification-binaries/current/local_compactor \
   --artifacts target/production-1000-001 \
@@ -168,7 +168,7 @@ Start at 1,000 mutations/s, then increase to 10,000 and 50,000. The baseline tar
 python3 tests/production/matrix.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --build-manifest target/qualification-binaries/current/build-manifest.json \
   --compactor-binary target/qualification-binaries/current/local_compactor \
   --artifacts target/production-matrix
@@ -182,7 +182,7 @@ Before changing maintenance architecture, run the controlled A/B/C/D comparison 
 python3 tests/production/maintenance_matrix.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --build-manifest target/qualification-binaries/current/build-manifest.json \
   --reader-baseline-compactor target/qualification-binaries/current/local_compactor \
   --artifacts target/production-maintenance-matrix-01
@@ -515,8 +515,8 @@ cargo build -p flow-testkit --example inspect_legacy_ledger
 uv run tests/production/journal_upgrade.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --previous-binary target/qualification-binaries/baseline/embrasure-flow \
-  --binary target/qualification-binaries/candidate/embrasure-flow \
+  --previous-binary target/qualification-binaries/baseline/contrast-flow \
+  --binary target/qualification-binaries/candidate/contrast-flow \
   --ledger-inspector target/debug/examples/inspect_legacy_ledger \
   --artifacts target/production-journal-upgrade-new
 ```
@@ -549,7 +549,7 @@ this disposable local fixture. Run it separately from performance measurements:
 uv run tests/production/health.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --artifacts target/production-health-new
 ```
 
@@ -573,7 +573,7 @@ and verifies that both publication and source ACK remain blocked until release.
 uv run tests/production/maintenance_priority.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --artifacts target/production-maintenance-priority-new
 ```
 
@@ -611,7 +611,7 @@ request bodies, and selects its own free loopback port.
 uv run tests/production/concurrent_compaction.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --artifacts target/production-concurrent-compaction-new
 ```
 
@@ -629,7 +629,7 @@ uv run tests/production/boundaries.py \
   --postgres-url "$FLOW_POSTGRES_URL" \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --artifacts target/production-boundaries-new
 ```
 
@@ -669,7 +669,7 @@ uv run tests/production/maintenance_fairness.py \
   --postgres-url "$FLOW_POSTGRES_URL" \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --artifacts target/production-maintenance-fairness-new
 ```
 
@@ -691,7 +691,7 @@ cannot admit another build while its worker remains held.
 ```sh
 uv run tests/production/parallel_compaction.py \
   --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/debug/embrasure-flow --artifacts target/service-parallel-compaction
+  --binary target/debug/contrast-flow --artifacts target/service-parallel-compaction
 ```
 
 The fixture uses four table workers and soft-only input debt. A binary limited
@@ -709,7 +709,7 @@ exact final updates/deletes/key moves, ACK, and clean shutdown.
 ```sh
 uv run tests/production/periodic_maintenance.py \
   --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/debug/embrasure-flow --artifacts target/service-periodic
+  --binary target/debug/contrast-flow --artifacts target/service-periodic
 ```
 
 Use `--two-hot-tables --table-workers 1 --timeout 600 --drain-timeout 900` for a shared single worker, or
@@ -739,7 +739,7 @@ qualification; values are deterministic, compressible MD5 text.
 ```sh
 uv run tests/production/wide_rows.py \
   --catalog-uri http://127.0.0.1:58181 --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --columns 256 --value-bytes 256 --rows 1000 \
   --transactions 12 --transaction-rows 200 \
   --artifacts target/wide-columns-01

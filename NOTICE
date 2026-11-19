@@ -1,4 +1,4 @@
-Embrasure Flow
+Contrast Flow
 
 This product includes Apache Iceberg Rust.
 Copyright 2023-2026 The Apache Software Foundation
@@ -16,6 +16,6 @@ Steven Fackler, licensed under the MIT or Apache-2.0 license, with local
 modifications described in vendor/tokio-postgres/LOCAL_CHANGES.md.
 
 The binary distribution includes third-party license and copyright notices
-under /usr/share/licenses/embrasure-flow. Its index.json identifies the locked
+under /usr/share/licenses/contrast-flow. Its index.json identifies the locked
 Rust dependencies and the included native-library notices. Debian package
 copyright and license texts remain under /usr/share/doc in the container.

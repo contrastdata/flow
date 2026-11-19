@@ -23,7 +23,7 @@ fn config_parse_errors_keep_locations_without_echoing_secrets() {
         ),
     ] {
         std::fs::write(&path, input).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+        let output = Command::new(env!("CARGO_BIN_EXE_contrast-flow"))
             .arg("--config")
             .arg(&path)
             .arg("check")
@@ -55,7 +55,7 @@ fn catalog_environment_is_required_only_when_connecting() {
             .insert(format!("{key}_env"), "FLOW_TEST_CATALOG_SECRET".into());
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         let command = || {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_embrasure-flow"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_contrast-flow"));
             command
                 .arg("--config")
                 .arg(&path)

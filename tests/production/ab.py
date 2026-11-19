@@ -119,7 +119,7 @@ def run(binaries, artifacts, arguments):
     command = ["uv", "run", str(ROOT / "tests/production/benchmark.py"),
                "--catalog-uri", f"http://127.0.0.1:{port['FLOW_PRODUCTION_REST_PORT']}",
                "--s3-endpoint", f"http://127.0.0.1:{port['FLOW_PRODUCTION_S3_PORT']}",
-               "--binary", str(binaries / "embrasure-flow"),
+               "--binary", str(binaries / "contrast-flow"),
                "--build-manifest", str(binaries / "build-manifest.json"),
                "--artifacts", str(artifacts), *arguments]
     with open(f"{artifacts}.log", "wb") as log:

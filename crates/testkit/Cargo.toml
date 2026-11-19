@@ -1,6 +1,6 @@
 [package]
 name = "flow-testkit"
-description = "Integration test support for Embrasure Flow"
+description = "Integration test support for Contrast Flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

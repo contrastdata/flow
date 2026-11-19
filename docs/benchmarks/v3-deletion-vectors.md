@@ -61,7 +61,7 @@ python3 tests/production/freeze_build.py --output target/benchmark-build
 uv run tests/production/benchmark.py \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/benchmark-build/embrasure-flow \
+  --binary target/benchmark-build/contrast-flow \
   --build-manifest target/benchmark-build/build-manifest.json \
   --reader-baseline-compactor target/benchmark-build/local_compactor \
   --reader-baseline-max-input-files 16384 --reader-baseline-timeout 900 \

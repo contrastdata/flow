@@ -38,13 +38,13 @@ jobs:
         with:
           shared-key: postgres
       - name: Build the daemon
-        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon --bin embrasure-flow
+        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon --bin contrast-flow
       - name: Build MinIO fixture images
         run: |
           docker build -f tests/production/Dockerfile.minio --target server -t flow-test-minio:RELEASE.2025-04-22T22-12-26Z tests/production
           docker build -f tests/production/Dockerfile.minio --target client -t flow-test-mc:RELEASE.2025-04-16T18-13-26Z tests/production
           docker save -o "$RUNNER_TEMP/minio-images.tar" flow-test-minio:RELEASE.2025-04-22T22-12-26Z flow-test-mc:RELEASE.2025-04-16T18-13-26Z
-          tar -cf "$RUNNER_TEMP/daemon.tar" target/debug/embrasure-flow
+          tar -cf "$RUNNER_TEMP/daemon.tar" target/debug/contrast-flow
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-inputs
@@ -113,7 +113,7 @@ jobs:
           uv run tests/production/crash_loop.py --duration 3600 --timeout 600
           ${SEED:+--seed "$SEED"}
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow --audit-snapshots 32
+          --binary target/debug/contrast-flow --audit-snapshots 32
           --artifacts "$RUNNER_TEMP/nightly-crash-loop"
       - name: Thirty-minute soak with resource-growth checks
         if: matrix.run == 'soak'
@@ -121,7 +121,7 @@ jobs:
           uv run tests/production/soak.py --duration 1800
           ${SEED:+--seed "$SEED"}
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/nightly-soak"
       - name: Service logs
         if: always()

@@ -1,6 +1,6 @@
 # Documentation
 
-## Using Embrasure Flow
+## Using Contrast Flow
 
 - [Getting started](getting-started.md): build, configuration, initialization, recovery and support boundaries.
 - [PostgreSQL type mappings](postgres-types.md): supported types, JSON semantics and schema changes.

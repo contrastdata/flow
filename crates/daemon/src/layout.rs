@@ -1,4 +1,4 @@
-//! `embrasure-flow layout`: each target's sort order and how its live data
+//! `contrast-flow layout`: each target's sort order and how its live data
 //! files follow it. Reads catalog metadata only, so it runs beside the daemon.
 
 use crate::config::Config;

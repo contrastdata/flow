@@ -3,8 +3,8 @@ state_dir = "/data"
 [source]
 connection_env = "FLOW_POSTGRES_URL"
 id = "orders-primary-v1"
-slot = "embrasure_flow"
-publication = "embrasure_flow"
+slot = "contrast_flow"
+publication = "contrast_flow"
 ack_mode = "materialized"
 journal_durability = "local-disk"
 

@@ -48,7 +48,7 @@ jobs:
           cargo fetch --locked
           python3 -B scripts/package_licenses.py --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-x86_64-linux"
           python3 -B scripts/package_licenses.py --target aarch64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-aarch64-linux"
-      - run: target/debug/embrasure-flow --config examples/flow.toml check
+      - run: target/debug/contrast-flow --config examples/flow.toml check
   jemalloc:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -75,10 +75,10 @@ jobs:
           cargo fetch --locked
           python3 -B scripts/package_licenses.py --features jemalloc --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-jemalloc-x86_64-linux"
           python3 -B scripts/package_licenses.py --features jemalloc --target aarch64-unknown-linux-gnu --output "$RUNNER_TEMP/licenses-jemalloc-aarch64-linux"
-      - run: target/debug/embrasure-flow --config examples/flow.toml check
+      - run: target/debug/contrast-flow --config examples/flow.toml check
       - name: Verify process-wide allocator linkage
         run: |
-          readelf --dyn-syms --wide target/debug/embrasure-flow > "$RUNNER_TEMP/flow-dynamic-symbols.txt"
+          readelf --dyn-syms --wide target/debug/contrast-flow > "$RUNNER_TEMP/flow-dynamic-symbols.txt"
           for symbol in malloc calloc realloc free; do
             if ! awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { found = 1 } END { exit !found }' "$RUNNER_TEMP/flow-dynamic-symbols.txt"; then
               echo "Missing defined dynamic allocator symbol: $symbol"

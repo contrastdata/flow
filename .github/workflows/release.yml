@@ -166,13 +166,13 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
-          name="embrasure-flow-${VERSION}-${TARGET}"
+          name="contrast-flow-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
-          cp target/release/embrasure-flow LICENSE NOTICE README.md CHANGELOG.md "dist/$name/"
+          cp target/release/contrast-flow LICENSE NOTICE README.md CHANGELOG.md "dist/$name/"
           cp examples/flow.toml "dist/$name/flow.example.toml"
           cargo fetch --locked
           python3 -B scripts/package_licenses.py --target "$TARGET" --output "dist/$name/licenses"
-          "dist/$name/embrasure-flow" --version
+          "dist/$name/contrast-flow" --version
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -212,7 +212,7 @@ jobs:
         with:
           images: ${{ needs.verify.outputs.image }}
           labels: |
-            org.opencontainers.image.title=Embrasure Flow
+            org.opencontainers.image.title=Contrast Flow
             org.opencontainers.image.description=Stream PostgreSQL changes into Apache Iceberg
             org.opencontainers.image.version=${{ needs.verify.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
@@ -310,5 +310,5 @@ jobs:
               gh release upload "$TAG" dist/*
             fi
           else
-            gh release create "$TAG" dist/* --verify-tag --title "Embrasure Flow $VERSION" --notes-file notes.md "${flags[@]}"
+            gh release create "$TAG" dist/* --verify-tag --title "Contrast Flow $VERSION" --notes-file notes.md "${flags[@]}"
           fi

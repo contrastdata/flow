@@ -19,7 +19,7 @@ def main():
                         default=["14.24", "15.19", "16.15", "17.11"])
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
-    parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/release/contrast-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     args = parser.parse_args()
     args.artifacts.mkdir(parents=True, exist_ok=False)

@@ -1,6 +1,6 @@
 [package]
 name = "flow-durability"
-description = "Object-storage durability authority for Embrasure Flow journals and control state"
+description = "Object-storage durability authority for Contrast Flow journals and control state"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

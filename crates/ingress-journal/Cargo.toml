@@ -1,6 +1,6 @@
 [package]
 name = "flow-ingress-journal"
-description = "Durable PostgreSQL transaction journal for Embrasure Flow"
+description = "Durable PostgreSQL transaction journal for Contrast Flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

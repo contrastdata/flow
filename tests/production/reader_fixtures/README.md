@@ -7,7 +7,7 @@ uv run tests/production/readers.py \
   --postgres-url 'postgres://flow:local-test-password@127.0.0.1:55432/flow?sslmode=disable' \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/release/embrasure-flow \
+  --binary target/release/contrast-flow \
   --artifacts target/production-readers-01
 ```
 
@@ -24,7 +24,7 @@ uv run tests/production/readers.py \
   --postgres-url 'postgres://flow:local-test-password@127.0.0.1:55432/flow?sslmode=disable' \
   --catalog-uri http://127.0.0.1:58181 \
   --s3-endpoint http://127.0.0.1:59000 \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --artifacts target/production-readers-native \
   --native-compaction --keyless-duplicates
 ```

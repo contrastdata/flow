@@ -27,7 +27,7 @@ use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(
-    name = "embrasure-flow",
+    name = "contrast-flow",
     version,
     about = "PostgreSQL streaming materialization into ordinary Iceberg v2/v3 tables"
 )]
@@ -144,7 +144,7 @@ fn fatal(error: &anyhow::Error, plain: bool) -> ExitCode {
         exit_code = class.code(),
         class = class.name(),
         error = %format!("{error:#}"),
-        "embrasure-flow stopped"
+        "contrast-flow stopped"
     );
     // A RUST_LOG that filters out this target must not hide why it stopped.
     if plain || !tracing::enabled!(tracing::Level::ERROR) {

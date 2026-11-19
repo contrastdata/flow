@@ -76,7 +76,7 @@ class FailedCycleTests(unittest.TestCase):
         loop.generation = 76
         (loop.directory / "daemon-76.log").write_text(
             '{"level":"INFO","fields":{"message":"starting"}}\n'
-            '{"level":"ERROR","fields":{"message":"embrasure-flow stopped","event":"fatal",'
+            '{"level":"ERROR","fields":{"message":"contrast-flow stopped","event":"fatal",'
             '"error":"source capture stopped"}}\n')
 
         def run_cycle(number, window, fault, details):

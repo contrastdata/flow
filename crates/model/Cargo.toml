@@ -1,6 +1,6 @@
 [package]
 name = "flow-model"
-description = "Shared data types and contracts for Embrasure Flow"
+description = "Shared data types and contracts for Contrast Flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

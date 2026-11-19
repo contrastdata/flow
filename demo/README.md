@@ -21,7 +21,7 @@ Publication and reader observation are distinct measurements. Built-in maintenan
 Initialization resumes from durable bootstrap state. Rerunning it on a completed bootstrap preserves the source slot and published tables. To restart only the running daemon, use `docker compose -f demo/compose.yaml restart flow`. SIGTERM waits for the daemon's graceful shutdown, with a 30-second container grace period. Inspect readiness and exact source watermarks with:
 
 ```sh
-docker compose -f demo/compose.yaml exec flow embrasure-flow --config /etc/flow.toml status
+docker compose -f demo/compose.yaml exec flow contrast-flow --config /etc/flow.toml status
 ```
 
 To remove this demo and its data, explicitly run `docker compose -f demo/compose.yaml down -v`.

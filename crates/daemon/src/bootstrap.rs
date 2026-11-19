@@ -1310,7 +1310,7 @@ mod tests {
 
         let stale = existing_slot(&config, false).to_string();
         assert!(
-            stale.contains("pg_drop_replication_slot('embrasure_flow')"),
+            stale.contains("pg_drop_replication_slot('contrast_flow')"),
             "{stale}"
         );
         let active = existing_slot(&config, true);

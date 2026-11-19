@@ -170,7 +170,7 @@ pub(crate) async fn connect_owned(
     if replication {
         pg.replication_mode(ReplicationMode::Logical);
     }
-    pg.application_name("embrasure-flow");
+    pg.application_name("contrast-flow");
     // Include the 25-byte XLogData envelope around one pgoutput message.
     // The same admission cap protects binary COPY workers before allocation.
     pg.max_backend_message_bytes(config.limits.source_message_bytes.saturating_add(25));
@@ -364,7 +364,7 @@ pub(crate) async fn capture_loop(
                         // journal/ledger path as row changes, without modifying rows.
                         if let Err(error) = source_deadline(async {
                             sql.query_one(
-                                "SELECT pg_catalog.pg_logical_emit_message(true, 'embrasure-flow-heartbeat', '')",
+                                "SELECT pg_catalog.pg_logical_emit_message(true, 'contrast-flow-heartbeat', '')",
                                 &[],
                             ).await?;
                             Ok(())

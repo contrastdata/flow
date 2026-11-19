@@ -19,7 +19,7 @@ fn init(state: &Path) -> std::process::Output {
         toml::Value::String("FLOW_STATE_PERMISSIONS_TEST_MISSING_CONNECTION".into());
     let path = temp.join("flow.toml");
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_embrasure-flow"))
+    Command::new(env!("CARGO_BIN_EXE_contrast-flow"))
         .args(["--config", path.to_str().unwrap(), "init"])
         .env_remove("FLOW_STATE_PERMISSIONS_TEST_MISSING_CONNECTION")
         .output()

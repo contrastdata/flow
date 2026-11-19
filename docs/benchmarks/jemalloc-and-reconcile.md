@@ -81,7 +81,7 @@ that sampled keys moved off the rewritten files. The scratch options are the
 daemon's. `FLOW_BENCH_SCRATCH_MIB` (default `16,64`) lists memtable sizes to
 compare, and each iteration rotates the order of the sizes.
 
-The same benchmark in Embrasure's internal build, timed phase by phase, spent
+The same benchmark in Contrast's internal build, timed phase by phase, spent
 about 18% of reconcile in scanning and staging into scratch. The rest was
 row-index work: a reverse-index check with one point lookup per removed row,
 a second lookup per row while staging into the index, and the apply. Both

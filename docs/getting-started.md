@@ -46,7 +46,7 @@ running `init`:
 ```sql
 -- public.orders must have the stable primary key described in flow.toml.
 ALTER TABLE public.orders REPLICA IDENTITY FULL;
-CREATE PUBLICATION embrasure_flow FOR TABLE public.orders
+CREATE PUBLICATION contrast_flow FOR TABLE public.orders
   WITH (publish = 'insert, update, delete, truncate');
 ```
 
@@ -147,7 +147,7 @@ Generate the `[[tables]]` blocks instead of writing them by hand. With the
 created, run:
 
 ```sh
-./target/release/embrasure-flow --config flow.toml discover >> flow.toml
+./target/release/contrast-flow --config flow.toml discover >> flow.toml
 ```
 
 By default `discover` describes the publication's tables that are not yet
@@ -189,8 +189,8 @@ An unchanged TOAST value is recovered from the complete old tuple under FULL, or
 
 ```sh
 export FLOW_POSTGRES_URL='postgres://user:password@host/database?sslmode=verify-full&sslrootcert=/etc/flow/postgres-ca.pem'
-./target/release/embrasure-flow --config flow.toml init
-./target/release/embrasure-flow --config flow.toml run
+./target/release/contrast-flow --config flow.toml init
+./target/release/contrast-flow --config flow.toml run
 ```
 
 The URL follows libpq, including its default `sslmode=prefer`, which silently

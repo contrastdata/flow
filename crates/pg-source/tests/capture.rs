@@ -216,7 +216,7 @@ fn logical_heartbeats_preserve_transaction_boundaries_and_reject_bad_lengths() {
             }
             b.put_u8(flags);
             b.put_u64(900);
-            b.extend_from_slice(b"embrasure-flow-heartbeat\0");
+            b.extend_from_slice(b"contrast-flow-heartbeat\0");
             b.put_u32(0);
         })
     };
