@@ -1,7 +1,7 @@
-// Added by Embrasure Flow; see LOCAL_CHANGES.md. Not part of upstream
+// Added by Contrast Flow; see LOCAL_CHANGES.md. Not part of upstream
 // Apache Iceberg Rust.
 //
-// Copyright 2026 The Embrasure Flow Authors
+// Copyright 2026 The Contrast Flow Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.

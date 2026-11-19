@@ -1,6 +1,6 @@
 # Service observations
 
-`embrasure-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
+`contrast-flow status` reads an atomic local observation without locking the state database. It reports the source identity, process, readiness, observation timestamp, captured durable LSN, ledger watermarks and registered pending transactions. Readiness expires after fifteen seconds without an update. SIGINT and SIGTERM clear it before shutdown. This file is not recovery authority.
 `status` exits 0 when the observation reports ready, 3 when it does not (the
 JSON is still printed), 78 when the configuration is invalid, and 1 when there
 is no readable observation.
@@ -379,7 +379,7 @@ Example Prometheus alerting rules; tune thresholds to your latency targets:
 
 ```yaml
 groups:
-  - name: embrasure-flow
+  - name: contrast-flow
     rules:
       - alert: FlowTableBlocked
         expr: flow_table_blocked == 1

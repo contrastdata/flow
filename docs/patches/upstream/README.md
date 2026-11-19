@@ -38,7 +38,7 @@ is included. The original end-to-end case is in
 
 ## Reproduce
 
-Run from the Embrasure Flow repository root. The first test invocation is
+Run from the Contrast Flow repository root. The first test invocation is
 expected to fail with leaked position `7`. After applying the fix, the relevant
 reader tests pass, including both positional-task orderings, the existing wait
 race, cache reuse, and V3 lookup and decryption.

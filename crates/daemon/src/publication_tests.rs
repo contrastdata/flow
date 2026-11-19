@@ -258,7 +258,7 @@ async fn publication_check_scopes_violations_to_tables_and_reads_one_snapshot() 
     std::fs::write(
         root.path().join("source-identity.json"),
         serde_json::json!({
-            "source_id": config.source.id, "slot": "embrasure_flow",
+            "source_id": config.source.id, "slot": "contrast_flow",
             "system_identifier": SYSTEM, "database": "source", "timeline": 1,
         })
         .to_string(),

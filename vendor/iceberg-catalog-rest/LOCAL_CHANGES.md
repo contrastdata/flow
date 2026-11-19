@@ -1,6 +1,6 @@
 # Local changes to iceberg-catalog-rest 0.10.1
 
-This package is modified by Embrasure Flow. It is not an unmodified ASF release.
+This package is modified by Contrast Flow. It is not an unmodified ASF release.
 The original Apache LICENSE, NOTICE, source headers, and `.cargo_vcs_info.json`
 are retained.
 

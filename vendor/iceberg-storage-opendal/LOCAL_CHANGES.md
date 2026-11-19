@@ -1,6 +1,6 @@
 # Local changes to iceberg-storage-opendal 0.10.1
 
-This package is modified by Embrasure Flow. It is not an unmodified ASF release.
+This package is modified by Contrast Flow. It is not an unmodified ASF release.
 The original Apache LICENSE, NOTICE, source headers, and `.cargo_vcs_info.json`
 are retained.
 
@@ -33,7 +33,7 @@ overflow the stack during execution or shutdown. S3 cache hits return the fully
 layered operator; other backends keep their existing layer path. A bounded-stack
 regression repeatedly constructs S3 writers and drops the final cache owner.
 Changed files: `src/lib.rs`, `src/resolving.rs`; `src/s3_operator_cache.rs` is
-new Embrasure Flow code and carries its own Apache-2.0 header. See
+new Contrast Flow code and carries its own Apache-2.0 header. See
 `docs/patches/iceberg-storage-opendal-operator-cache.patch`.
 
 `OpenDalResolvingStorage` formats its shared properties in `Debug` output as key

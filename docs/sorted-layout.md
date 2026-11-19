@@ -40,7 +40,7 @@ not sorted in the current order.
 
 Flow writes orders whose fields are identity transforms on any replicated
 column. A table whose order uses another transform (`bucket`, `truncate`, a time
-transform) is written unsorted; `embrasure-flow layout` says so.
+transform) is written unsorted; `contrast-flow layout` says so.
 
 Declaring an order also tells other writers to follow it. Spark and Trino sort
 their writes, and S3 Tables' managed compaction switches from bin-packing to
@@ -116,7 +116,7 @@ output is. The `compaction_input_out_of_order` event and
 
 ## Inspecting a table
 
-`embrasure-flow layout` reads catalog metadata only and can run beside the
+`contrast-flow layout` reads catalog metadata only and can run beside the
 daemon. `--table namespace.table` selects one target and `--json` prints JSON.
 
 ```

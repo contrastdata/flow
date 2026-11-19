@@ -6,7 +6,7 @@ Please do not report security vulnerabilities in public issues, discussions or
 pull requests.
 
 Report them privately through GitHub:
-[**Report a vulnerability**](https://github.com/EmbrasureAI/flow/security/advisories/new)
+[**Report a vulnerability**](https://github.com/contrastdata/flow/security/advisories/new)
 (Security tab → Advisories → Report a vulnerability). Include:
 
 - the affected version or commit;

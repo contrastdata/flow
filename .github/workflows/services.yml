@@ -33,23 +33,23 @@ jobs:
           # Retain the existing service-build dependency cache across this job split.
           shared-key: postgres
       - name: Build service binaries
-        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin embrasure-flow --example local_compactor
+        run: cargo build --locked --features flow-daemon/jemalloc -p flow-daemon -p flow-testkit --bin contrast-flow --example local_compactor
       - name: Build PostgreSQL regression tests
         run: |
           cargo test --locked -p flow-pg-source --test snapshot_timeout --test snapshot_slots --test schema_batch --test superset_publication --no-run --message-format=json > target/pg-test-build.jsonl
-          cargo test --locked --features flow-daemon/jemalloc -p flow-daemon --bin embrasure-flow --no-run --message-format=json > target/daemon-test-build.jsonl
+          cargo test --locked --features flow-daemon/jemalloc -p flow-daemon --bin contrast-flow --no-run --message-format=json > target/daemon-test-build.jsonl
           python3 - <<'PYTEST'
           import json
           import shutil
           from pathlib import Path
           artifacts = [json.loads(line) for name in ("pg", "daemon") for line in Path(f"target/{name}-test-build.jsonl").read_text().splitlines()]
-          for name, output in (("snapshot_slots", "snapshot_slots_tests"), ("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("embrasure-flow", "daemon_tests")):
+          for name, output in (("snapshot_slots", "snapshot_slots_tests"), ("snapshot_timeout", "snapshot_timeout_tests"), ("schema_batch", "schema_batch_tests"), ("superset_publication", "superset_publication_tests"), ("contrast-flow", "daemon_tests")):
               executable, = [item["executable"] for item in artifacts if item.get("executable") and item.get("profile", {}).get("test") and item.get("target", {}).get("name") == name]
               shutil.copy2(executable, f"target/debug/{output}")
           PYTEST
       - name: Package service binaries with executable permissions and checksums
         run: |
-          binaries=(target/debug/embrasure-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/snapshot_slots_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
+          binaries=(target/debug/contrast-flow target/debug/examples/local_compactor target/debug/snapshot_timeout_tests target/debug/snapshot_slots_tests target/debug/schema_batch_tests target/debug/superset_publication_tests target/debug/daemon_tests)
           sha256sum "${binaries[@]}" > target/service-binaries.sha256
           tar -cf "$RUNNER_TEMP/service-binaries.tar" "${binaries[@]}" target/service-binaries.sha256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -214,7 +214,7 @@ jobs:
         run: >-
           uv run tests/production/faults.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --compactor-binary target/debug/examples/local_compactor
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults"
       - name: Source schema isolation, nullability, restart and selected-column blocks
@@ -234,28 +234,28 @@ jobs:
         run: >-
           uv run tests/production/type_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-type-compat"
       - name: Explicit projection through excluded types, DDL and durable restart
         if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/projection_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-projection-compat"
       - name: Time values, key movement and nullable time schema evolution
         if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/time_vector_compat.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-time-compat"
       - name: Snapshot inheritance and row-security contracts
         if: matrix.suite == 'compatibility'
         run: >-
           uv run tests/production/source_snapshot_contracts.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-snapshot-contracts"
       - name: Interrupted parallel bootstrap and index reconstruction
         if: matrix.suite == 'compatibility'
@@ -286,7 +286,7 @@ jobs:
             read -r columns value_bytes rows transaction_rows <<< "$dimensions"
             uv run tests/production/wide_rows.py \
               --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
-              --binary target/debug/embrasure-flow --timeout 600 \
+              --binary target/debug/contrast-flow --timeout 600 \
               --columns "$columns" --value-bytes "$value_bytes" --rows "$rows" \
               --transactions 12 --transaction-rows "$transaction_rows" \
               --artifacts "$RUNNER_TEMP/service-wide-${columns}"
@@ -296,7 +296,7 @@ jobs:
         run: >-
           uv run tests/production/pressure.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --compactor-binary target/debug/examples/local_compactor
           --artifacts "$RUNNER_TEMP/service-pressure"
       - name: CDC during held compaction reads and abandoned build recovery
@@ -304,42 +304,42 @@ jobs:
         run: >-
           uv run tests/production/concurrent_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-concurrent-compaction"
       - name: Two-table compaction cancellation and recovery
         if: matrix.suite == 'compaction'
         run: >-
           uv run tests/production/parallel_compaction.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-parallel-compaction"
       - name: WAL monitor timeout, readiness and recovery
         if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/health.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-health"
       - name: Background compaction admission under queued CDC
         if: matrix.suite == 'lifecycle'
         run: >-
           uv run tests/production/maintenance_fairness.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-maintenance-fairness"
       - name: Quiet-table compaction after restart beside queued CDC
         if: matrix.suite == 'compaction'
         run: >-
           uv run tests/production/maintenance_fairness.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow --cold-table
+          --binary target/debug/contrast-flow --cold-table
           --artifacts "$RUNNER_TEMP/service-maintenance-cold-table"
       - name: Periodic cleanup with a single shared worker
         if: matrix.suite == 'periodic-single-worker'
         run: >-
           uv run tests/production/periodic_maintenance.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --two-hot-tables --table-workers 1
           --timeout 600 --drain-timeout 900
           --artifacts "$RUNNER_TEMP/service-periodic-single-worker"
@@ -348,7 +348,7 @@ jobs:
         run: >-
           uv run tests/production/periodic_maintenance.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --two-hot-tables
           --timeout 600
           --artifacts "$RUNNER_TEMP/service-periodic-with-builds"
@@ -357,7 +357,7 @@ jobs:
         run: >-
           uv run tests/production/boundaries.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-boundaries"
       - name: Standard readers with native and external maintenance
         if: matrix.suite == 'readers'
@@ -377,21 +377,21 @@ jobs:
         run: >-
           uv run tests/local/default_identity.py
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-default-identity"
       - name: Crash recovery with journaled acknowledgement
         if: matrix.suite == 'isolation'
         run: >-
           uv run tests/production/faults.py --ack-mode journaled
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults-journaled"
       - name: Iceberg v3 crash recovery and concurrent compaction
         if: matrix.suite == 'v3'
         run: >-
           uv run tests/production/faults.py --format-version 3
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --compactor-binary target/debug/examples/local_compactor
           --compose-project flow-ci --artifacts "$RUNNER_TEMP/service-faults-v3"
       - name: Iceberg v3 standard readers with native and external maintenance
@@ -407,7 +407,7 @@ jobs:
         run: >-
           uv run tests/production/crash_loop.py --duration 240
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-crash-loop"
       - name: Service logs
         if: always()
@@ -499,7 +499,7 @@ jobs:
         run: >-
           uv run tests/production/time_vector_compat.py --vector
           --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL"
-          --binary target/debug/embrasure-flow
+          --binary target/debug/contrast-flow
           --artifacts "$RUNNER_TEMP/service-vector-compat"
       - name: Service logs
         if: always()

@@ -8,7 +8,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo/config.toml ./.cargo/config.toml
 COPY crates ./crates
 COPY vendor ./vendor
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo build --locked --release -p flow-daemon --features "$FLOW_FEATURES" && cp target/release/embrasure-flow /usr/local/bin/embrasure-flow
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo build --locked --release -p flow-daemon --features "$FLOW_FEATURES" && cp target/release/contrast-flow /usr/local/bin/contrast-flow
 COPY LICENSE NOTICE ./
 COPY licenses ./licenses
 COPY scripts/package_licenses.py ./scripts/package_licenses.py
@@ -16,10 +16,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home flow
-COPY --from=build /usr/local/bin/embrasure-flow /usr/local/bin/embrasure-flow
-COPY --from=build /licenses /usr/share/licenses/embrasure-flow
-RUN install -d -m 0700 -o flow -g flow /data
+COPY --from=build /usr/local/bin/contrast-flow /usr/local/bin/contrast-flow
+COPY --from=build /licenses /usr/share/licenses/contrast-flow
+RUN install -d -m 0700 -o flow -g flow /data \
+    && ln -s contrast-flow /usr/local/bin/embrasure-flow \
+    && ln -s contrast-flow /usr/share/licenses/embrasure-flow
 USER flow
 WORKDIR /data
-ENTRYPOINT ["embrasure-flow"]
+ENTRYPOINT ["contrast-flow"]
 CMD ["--config", "/etc/flow.toml", "run"]

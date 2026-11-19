@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to Embrasure Flow. The format follows
+Notable changes to Contrast Flow. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) as described in
 [upgrading](docs/upgrading.md): while Flow is 0.x, a minor release may change
@@ -17,6 +17,13 @@ This will be the initial public release, `0.1.0`.
 
 From earlier development builds of `main`:
 
+- The binary, container entrypoint and license bundle are renamed from
+  `embrasure-flow` to `contrast-flow`, and the daemon connects to PostgreSQL
+  with `application_name = 'contrast-flow'`. The container image keeps
+  `embrasure-flow` as a symlink to the new binary, so existing commands still
+  work; update service units, scripts and monitoring that reference the old
+  name. Existing durable state, replication slots, publications and Iceberg
+  snapshot metadata are unchanged, so a running deployment upgrades in place.
 - `delete_layout` now defaults to `"per_target"`. Existing format v2 tables
   keep their shared delete files until consolidation or a data rewrite
   replaces them; set `delete_layout = "shared"` to keep the previous
@@ -141,7 +148,7 @@ From earlier development builds of `main`:
   metadata JSON waits `limits.metadata_json_grace_secs` (one hour by default)
   after leaving the catalog's metadata log. Catalog metadata JSON written
   outside Flow's paths (`write.metadata.path`) is never collected.
-- `embrasure-flow metadata-import` adopts existing catalog metadata JSON into
+- `contrast-flow metadata-import` adopts existing catalog metadata JSON into
   grace-delayed collection.
 - Maintenance failures back off per table instead of stopping the daemon.
 - Data rewrites of keyed tables, background and strict, commit one index
@@ -196,17 +203,17 @@ From earlier development builds of `main`:
 
 **Commands and configuration**
 
-- `embrasure-flow layout [--table namespace.table] [--json]` prints each
+- `contrast-flow layout [--table namespace.table] [--json]` prints each
   target's sort order, the share of rows in files marked with it, files by
   level, key-range overlap and advice, from catalog metadata. Periodic
   maintenance exports `flow_table_sort_order_id`,
   `flow_table_sorted_rows_ratio`, `flow_table_unsorted_bytes` and
   `flow_table_sort_overlap_files`; `flow_epoch_sort_total{result}` counts how
   epochs of sorted tables were written.
-- `embrasure-flow discover` prints `[[tables]]` configuration for the
+- `contrast-flow discover` prints `[[tables]]` configuration for the
   publication's tables, named tables or a schema, using the same type mapping
   and validation as `init`.
-- `embrasure-flow check --source` runs read-only PostgreSQL readiness checks;
+- `contrast-flow check --source` runs read-only PostgreSQL readiness checks;
   `check --storage` verifies every index checksum offline. The full checksum
   scan also runs at startup after an unclean exit or with
   `storage.verify_index_on_start = true`.
@@ -585,4 +592,4 @@ From earlier development builds of `main`:
 - A scheduled dependency audit and Dependabot run in CI, and workflow actions
   are pinned by commit.
 
-[Unreleased]: https://github.com/EmbrasureAI/flow/commits/main
+[Unreleased]: https://github.com/contrastdata/flow/commits/main

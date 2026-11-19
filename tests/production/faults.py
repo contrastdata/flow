@@ -521,7 +521,7 @@ def main():
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
-    parser.add_argument("--binary", type=Path, default=Path("target/release/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/release/contrast-flow"))
     parser.add_argument("--compactor-binary", type=Path)
     parser.add_argument("--compose-project", required=True)
     parser.add_argument("--compose-file", type=Path, default=Path("tests/production/compose.yaml"))

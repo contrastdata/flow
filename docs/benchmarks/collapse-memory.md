@@ -76,7 +76,7 @@ binaries, and run each configuration serially with fresh artifact directories:
 ```sh
 uv run tests/production/benchmark.py \
   --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
-  --binary target/qualification-binaries/current/embrasure-flow \
+  --binary target/qualification-binaries/current/contrast-flow \
   --build-manifest target/qualification-binaries/current/build-manifest.json \
   --artifacts target/collapse-memory-50k-01 --rate 50000 --duration 60 --warmup 10
 ```

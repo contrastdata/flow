@@ -66,7 +66,7 @@ def freeze(output, *, profile="release", target=None, features=(), no_default_fe
     output = Path(output).resolve()
     if output.exists():
         raise FileExistsError(f"output already exists: {output}")
-    with tempfile.TemporaryDirectory(prefix="embrasure-flow-qualification-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="contrast-flow-qualification-") as temporary:
         staging = Path(target_dir).resolve() if target_dir else Path(temporary)
         environment = os.environ.copy()
         environment["CARGO_TARGET_DIR"] = str(staging)
@@ -93,14 +93,14 @@ def freeze(output, *, profile="release", target=None, features=(), no_default_fe
             command.append("--no-default-features")
         for feature in features:
             command += ["--features", feature]
-        command += ["-p", "flow-daemon", "-p", "flow-testkit", "--bin", "embrasure-flow",
+        command += ["-p", "flow-daemon", "-p", "flow-testkit", "--bin", "contrast-flow",
                     "--example", "local_compactor"]
         subprocess.run(command, cwd=root, env=environment, check=True)
         ensure_repository_unchanged(identity, root)
 
         build_dir = staging / target / cargo_profile
         staged_binaries = {
-            "daemon": build_dir / "embrasure-flow",
+            "daemon": build_dir / "contrast-flow",
             "external_compactor": build_dir / "examples/local_compactor",
         }
         binaries = {

@@ -23,7 +23,7 @@ body:
     id: version
     attributes:
       label: Flow version or commit
-      description: Output of `embrasure-flow --version`, the image tag, or the commit.
+      description: Output of `contrast-flow --version`, the image tag, or the commit.
     validations:
       required: true
   - type: input
@@ -37,7 +37,7 @@ body:
     id: status
     attributes:
       label: Status and logs
-      description: Output of `embrasure-flow status` and the relevant structured log lines.
+      description: Output of `contrast-flow status` and the relevant structured log lines.
       render: text
   - type: textarea
     id: configuration

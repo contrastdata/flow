@@ -9,7 +9,7 @@
 #
 # Environment: FLOW_FIXTURE_PROJECT (default flow-production-local), the ports
 # in target/production-local/ports.env (created with defaults if absent) and
-# FLOW_FIXTURE_REPOSITORY (default EmbrasureAI/flow), whose CI artifacts supply
+# FLOW_FIXTURE_REPOSITORY (default contrastdata/flow), whose CI artifacts supply
 # prebuilt MinIO images. FLOW_PRODUCTION_WAREHOUSE=s3://bucket/prefix/ points
 # the catalog at real S3 with the caller's AWS credentials; see
 # compose.aws-s3.yaml.
@@ -20,7 +20,7 @@ project=${FLOW_FIXTURE_PROJECT:-flow-production-local}
 ports=$root/target/production-local/ports.env
 minio_image=flow-test-minio:RELEASE.2025-04-22T22-12-26Z
 mc_image=flow-test-mc:RELEASE.2025-04-16T18-13-26Z
-repository=${FLOW_FIXTURE_REPOSITORY:-EmbrasureAI/flow}
+repository=${FLOW_FIXTURE_REPOSITORY:-contrastdata/flow}
 
 ensure_ports() {
   if [[ ! -f $ports ]]; then

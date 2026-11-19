@@ -333,7 +333,7 @@ def main():
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
-    parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/debug/contrast-flow"))
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--quota", action="store_true", help="run the separate 128 MiB journal-full pause and drain case")

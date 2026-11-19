@@ -3,7 +3,7 @@ index 52f4e68..85ed1ea 100644
 --- a/vendor/iceberg-storage-opendal/src/lib.rs
 +++ b/vendor/iceberg-storage-opendal/src/lib.rs
 @@ -1,3 +1,4 @@
-+// Modified by Embrasure Flow; see LOCAL_CHANGES.md.
++// Modified by Contrast Flow; see LOCAL_CHANGES.md.
  // Licensed to the Apache Software Foundation (ASF) under one
  // or more contributor license agreements.  See the NOTICE file
  // distributed with this work for additional information
@@ -166,10 +166,10 @@ index 0000000..e60fec2
 --- /dev/null
 +++ b/vendor/iceberg-storage-opendal/src/s3_operator_cache.rs
 @@ -0,0 +1,117 @@
-+// Added by Embrasure Flow; see LOCAL_CHANGES.md. Not part of upstream
++// Added by Contrast Flow; see LOCAL_CHANGES.md. Not part of upstream
 +// Apache Iceberg Rust.
 +//
-+// Copyright 2026 The Embrasure Flow Authors
++// Copyright 2026 The Contrast Flow Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
 +// you may not use this file except in compliance with the License.

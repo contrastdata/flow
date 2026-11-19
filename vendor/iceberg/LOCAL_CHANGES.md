@@ -1,6 +1,6 @@
 # Local changes to iceberg 0.10.1
 
-This package is modified by Embrasure Flow. It is not an unmodified ASF release.
+This package is modified by Contrast Flow. It is not an unmodified ASF release.
 The original Apache LICENSE, NOTICE, source headers, and `.cargo_vcs_info.json`
 are retained.
 
@@ -103,7 +103,7 @@ redacted values, since they carry object-store credentials; `FileIO` and
 `FileIOBuilder` print it. Changed file: `src/io/storage/config/mod.rs`. See
 `docs/patches/iceberg-debug-redaction.patch`.
 
-`src/puffin/deletion_vector.rs` is new Embrasure Flow code added by the v3 patch,
+`src/puffin/deletion_vector.rs` is new Contrast Flow code added by the v3 patch,
 not Apache Software Foundation code; it carries its own Apache-2.0 header.
 
 The observed-size DV patch adds `read_deletion_vector_with_size`, allowing a

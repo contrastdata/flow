@@ -618,7 +618,7 @@ def main():
     parser.add_argument("--catalog-uri", required=True)
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--warehouse", default="s3://warehouse/")
-    parser.add_argument("--binary", type=Path, default=Path("target/debug/embrasure-flow"))
+    parser.add_argument("--binary", type=Path, default=Path("target/debug/contrast-flow"))
     parser.add_argument("--artifacts", type=Path, required=True, help="new directory; logs/state retained even on failure")
     parser.add_argument("--timeout", type=float, default=180, help="maximum seconds per wait/init")
     args = parser.parse_args()

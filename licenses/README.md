@@ -1,6 +1,6 @@
 # Licenses and distribution notices
 
-The repository's root `LICENSE` grants Apache-2.0 for Embrasure Flow. Vendored
+The repository's root `LICENSE` grants Apache-2.0 for Contrast Flow. Vendored
 Iceberg code retains its upstream licenses, attribution notices and documented
 local changes. Dependency licenses apply to their respective components; this
 project does not relicense them.
@@ -10,7 +10,7 @@ binary notices. Most dependency notices come directly from Cargo packages.
 `supplemental.json` pins missing texts to exact package versions, upstream sources
 and SHA-256 hashes. Identical Apache license texts share one checked-in copy.
 
-The Docker build generates a bundle at `/usr/share/licenses/embrasure-flow`.
+The Docker build generates a bundle at `/usr/share/licenses/contrast-flow`.
 Its `index.json` records the target, compiler, requested and resolved features,
 Cargo.lock hash, dependency versions,
 crate checksums and hashes of bundled notices. It covers the daemon's normal and

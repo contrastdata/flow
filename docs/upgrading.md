@@ -41,7 +41,7 @@ proceed stops before it acknowledges or publishes anything.
    version has run successfully.
 4. Replace the binary or image tag. Keep the same configuration unless the
    notes say otherwise.
-5. Run `embrasure-flow --config flow.toml check` and `check --source`.
+5. Run `contrast-flow --config flow.toml check` and `check --source`.
 6. Start `run` and confirm that `status` (or `/readyz`) becomes ready and that
    the materialized watermark advances.
 

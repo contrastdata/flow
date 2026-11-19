@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Modified by Embrasure Flow: preserve UUID logical types through Arrow schemas.
+// Modified by Contrast Flow: preserve UUID logical types through Arrow schemas.
 
 //! Conversion between Arrow schema and Iceberg schema.
 

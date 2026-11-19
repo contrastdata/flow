@@ -64,7 +64,7 @@ class Validation:
 
     def status(self, check=True, stopped=False):
         command = ([*self.compose, "run", "--rm", "--no-deps", "flow"] if stopped
-                   else [*self.compose, "exec", "-T", "flow", "embrasure-flow"])
+                   else [*self.compose, "exec", "-T", "flow", "contrast-flow"])
         result = self.run([*command, "--config", "/etc/flow.toml", "status"], check=check)
         return json.loads(result.stdout) if result.returncode == 0 else {}
 
@@ -94,7 +94,7 @@ class Validation:
         assert identity == "10001", f"daemon is running as unexpected UID: {identity}"
         ownership = self.run([*self.compose, "exec", "-T", "flow", "stat", "-c", "%u:%g %n", "/data", "/data/control", "/data/index"]).stdout
         assert all(line.startswith("10001:10001 ") for line in ownership.splitlines()), ownership
-        binary = self.run([*self.compose, "exec", "-T", "flow", "sha256sum", "/usr/local/bin/embrasure-flow"]).stdout.strip()
+        binary = self.run([*self.compose, "exec", "-T", "flow", "sha256sum", "/usr/local/bin/contrast-flow"]).stdout.strip()
         return {"uid": identity, "ownership": ownership, "binary": binary}
 
     def mutations(self):
@@ -125,10 +125,10 @@ COMMIT;""")
         result = self.verify("restart")
         # The initializer is idempotent against its durable bootstrap and does
         # not reset the permanent source slot or overwrite a live base.
-        slot = self.psql("SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name='embrasure_flow'")
+        slot = self.psql("SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name='contrast_flow'")
         self.run([*self.compose, "stop", "--timeout", "30", "flow"])
         self.run([*self.compose, "run", "--rm", "--no-deps", "initialize"])
-        assert self.psql("SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name='embrasure_flow'") == slot
+        assert self.psql("SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name='contrast_flow'") == slot
         self.run([*self.compose, "start", "flow"])
         result["idempotent_initialize"] = self.verify("reinitialize")
         return result

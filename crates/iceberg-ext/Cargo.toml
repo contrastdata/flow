@@ -1,6 +1,6 @@
 [package]
 name = "flow-iceberg-ext"
-description = "Iceberg commit and metadata operations for Embrasure Flow"
+description = "Iceberg commit and metadata operations for Contrast Flow"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

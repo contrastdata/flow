@@ -101,7 +101,7 @@ class FinalCheckTests(unittest.TestCase):
 class ReproductionTests(unittest.TestCase):
     def test_command_replays_the_soak_with_its_detector_settings(self):
         args = argparse.Namespace(seed=2245799672, duration=1800, writers=3, large_rows=12000, large_interval=15,
-                                  format_version=2, binary=Path("target/debug/embrasure-flow"), timeout=600,
+                                  format_version=2, binary=Path("target/debug/contrast-flow"), timeout=600,
                                   sample_seconds=30, verify_every=600, retention_secs=120,
                                   warmup_fraction=0.5, rss_tolerance=0.4, state_tolerance=0.5,
                                   metadata_tolerance=0.25, malloc_conf=None)
@@ -109,7 +109,7 @@ class ReproductionTests(unittest.TestCase):
         self.assertTrue(command.startswith("uv run tests/production/soak.py --seed 2245799672 "))
         for option in ("--duration 1800", "--warmup-fraction 0.5", "--rss-tolerance 0.4",
                        "--state-tolerance 0.5", "--metadata-tolerance 0.25", "--retention-secs 120",
-                       "--binary target/debug/embrasure-flow", "--timeout 600"):
+                       "--binary target/debug/contrast-flow", "--timeout 600"):
             self.assertIn(option, command)
         self.assertNotIn("--malloc-conf", command)
         args.malloc_conf = "thp:never"
@@ -120,7 +120,7 @@ class ProcessMemoryTests(unittest.TestCase):
     def test_linux_rss_components_are_parsed(self):
         proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (proc / "42").mkdir()
-        (proc / "42" / "status").write_text("Name:\tembrasure-flow\nVmRSS:\t   3072 kB\nRssAnon:\t   2048 kB\n"
+        (proc / "42" / "status").write_text("Name:\tcontrast-flow\nVmRSS:\t   3072 kB\nRssAnon:\t   2048 kB\n"
                                             "RssFile:\t    1000 kB\nRssShmem:\t      24 kB\nThreads:\t37\n")
         (proc / "42" / "smaps_rollup").write_text("Rss:                3072 kB\nLazyFree:             8 kB\n"
                                                   "AnonHugePages:     2048 kB\n")
@@ -134,7 +134,7 @@ class ProcessMemoryTests(unittest.TestCase):
         proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (proc / "42").mkdir()
         (proc / "42" / "smaps").write_text(
-            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/embrasure-flow\n"
+            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/contrast-flow\n"
             "Rss:                1024 kB\nAnonHugePages:         0 kB\n"
             "7f0000000000-7f0000400000 rw-p 00000000 00:00 0 \n"
             "Rss:                4096 kB\nAnonHugePages:      2048 kB\n"
@@ -145,7 +145,7 @@ class ProcessMemoryTests(unittest.TestCase):
             "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]\n"
             "Rss:                  32 kB\nAnonHugePages:         0 kB\n")
         self.assertEqual(mapping_summary(42, proc), {
-            "embrasure-flow": {"mappings": 1, "rss_bytes": 1024 * 1024, "anon_huge_page_bytes": 0},
+            "contrast-flow": {"mappings": 1, "rss_bytes": 1024 * 1024, "anon_huge_page_bytes": 0},
             "anon<64MiB": {"mappings": 2, "rss_bytes": 6144 * 1024, "anon_huge_page_bytes": 4096 * 1024},
             "anon<2MiB": {"mappings": 1, "rss_bytes": 64 * 1024, "anon_huge_page_bytes": 0},
             "[stack]": {"mappings": 1, "rss_bytes": 32 * 1024, "anon_huge_page_bytes": 0},
@@ -160,7 +160,7 @@ class ProcessMemoryTests(unittest.TestCase):
             "Rss:               65536 kB\nAnonHugePages:     61440 kB\nTHPeligible:    1\nVmFlags: rd wr mr mw me ac\n"
             "7f1000000000-7f1000400000 rw-p 00000000 00:00 0 \n"
             "Rss:                4096 kB\nAnonHugePages:         0 kB\nTHPeligible:    0\nVmFlags: rd wr mr mw me nh\n"
-            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/embrasure-flow\n"
+            "55d0a0000000-55d0a8000000 r-xp 00000000 08:01 1234 /runner/target/debug/contrast-flow\n"
             "Rss:              131072 kB\nAnonHugePages:         0 kB\n")
         self.assertEqual(largest_anonymous_mappings(42, proc=proc), [
             {"size_bytes": 64 << 20, "rss_bytes": 64 << 20, "anon_huge_page_bytes": 60 << 20,
