@@ -25,6 +25,9 @@ pub struct Config {
     pub compaction: flow_compactor::Policy,
     #[serde(default)]
     pub parquet_read: flow_compactor::ReadLimits,
+    /// Distinct-value statistics of target tables; off unless enabled.
+    #[serde(default)]
+    pub statistics: Statistics,
     /// Optional HTTP endpoints for probes and Prometheus scraping.
     #[serde(default)]
     pub http: Option<Http>,
@@ -127,6 +130,91 @@ pub struct Table {
     /// How files written in an earlier spec reach the current one.
     #[serde(default)]
     pub partition_convert: PartitionConvert,
+    /// Columns whose distinct values are sketched when `[statistics]` is
+    /// enabled: `"auto"`, `"none"` or a list of column names. Absent:
+    /// `[statistics] columns`.
+    #[serde(default)]
+    pub statistics: Option<StatisticsColumns>,
+}
+
+/// `[statistics]`: Theta sketches of distinct values, published as Iceberg
+/// statistics files readers such as Trino use for planning. Off by default.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Statistics {
+    pub enabled: bool,
+    /// Columns of tables without their own `statistics` setting.
+    pub columns: StatisticsColumns,
+    /// Most columns `"auto"` selects per table.
+    pub max_columns: usize,
+    /// Least time between two publications of one table's statistics.
+    pub refresh_interval_secs: u64,
+    /// Publish only when sketched data files hold this share of the rows.
+    pub min_coverage_percent: u8,
+    /// Rebuild a table's sketches once rewritten files held this share.
+    pub recompute_percent: u8,
+    /// Sketch files one visit reads.
+    pub max_sketch_reads: usize,
+    /// Unsketched data files one visit reads to sketch.
+    pub backfill_files: usize,
+}
+
+impl Default for Statistics {
+    fn default() -> Self {
+        let policy = flow_coordinator::StatisticsPolicy::default();
+        Self {
+            enabled: false,
+            columns: StatisticsColumns::Auto,
+            max_columns: 16,
+            refresh_interval_secs: policy.refresh_interval.as_secs(),
+            min_coverage_percent: policy.min_coverage_percent,
+            recompute_percent: policy.recompute_percent,
+            max_sketch_reads: policy.max_sketch_reads,
+            backfill_files: policy.backfill_files,
+        }
+    }
+}
+
+impl Statistics {
+    pub fn policy(&self) -> flow_coordinator::StatisticsPolicy {
+        flow_coordinator::StatisticsPolicy {
+            refresh_interval: std::time::Duration::from_secs(self.refresh_interval_secs),
+            min_coverage_percent: self.min_coverage_percent,
+            recompute_percent: self.recompute_percent,
+            max_sketch_reads: self.max_sketch_reads,
+            backfill_files: self.backfill_files,
+            ..Default::default()
+        }
+    }
+}
+
+/// Columns to sketch: `"auto"`, `"none"`, or column names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatisticsColumns {
+    /// Primary-key columns, then integer, date, timestamp, UUID, decimal and
+    /// string columns in schema order, up to `max_columns`.
+    Auto,
+    None,
+    Columns(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for StatisticsColumns {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Columns(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Name(name) if name == "auto" => Ok(Self::Auto),
+            Raw::Name(name) if name == "none" => Ok(Self::None),
+            Raw::Name(_) => Err(serde::de::Error::custom(
+                "statistics must be \"auto\", \"none\" or a list of columns",
+            )),
+            Raw::Columns(columns) => Ok(Self::Columns(columns)),
+        }
+    }
 }
 
 /// A configured partition spec: `"none"`, or a list of partition fields.
@@ -267,6 +355,73 @@ fn partition_field_name(column: &str, transform: &iceberg::spec::Transform) -> S
 }
 
 impl Table {
+    /// The columns this table sketches under `statistics`, or `None` when
+    /// statistics are off for it.
+    pub fn sketch_selection(
+        &self,
+        statistics: &Statistics,
+        schema: &TableSchema,
+    ) -> Result<Option<flow_materializer::SketchSelection>> {
+        let setting = self.statistics.as_ref().unwrap_or(&statistics.columns);
+        let fields: Vec<i32> = match setting {
+            StatisticsColumns::None => return Ok(None),
+            StatisticsColumns::Columns(names) => {
+                ensure!(
+                    !names.is_empty(),
+                    "statistics lists no columns; use \"none\""
+                );
+                let mut fields = Vec::new();
+                for name in names {
+                    let column = schema
+                        .columns
+                        .iter()
+                        .find(|column| &column.name == name)
+                        .with_context(|| {
+                            format!("statistics column {name:?} is not a configured column")
+                        })?;
+                    ensure!(
+                        !fields.contains(&column.field_id),
+                        "statistics lists column {name:?} twice"
+                    );
+                    fields.push(column.field_id);
+                }
+                fields
+            }
+            StatisticsColumns::Auto => {
+                use flow_model::ColumnType;
+                let mut fields: Vec<i32> = schema
+                    .primary_key
+                    .iter()
+                    .map(|&index| schema.columns[index].field_id)
+                    .collect();
+                for column in &schema.columns {
+                    let eligible = matches!(
+                        column.data_type,
+                        ColumnType::Int32
+                            | ColumnType::Int64
+                            | ColumnType::Date
+                            | ColumnType::TimestampMicros
+                            | ColumnType::TimestampTzMicros
+                            | ColumnType::Uuid
+                            | ColumnType::Decimal { .. }
+                            | ColumnType::String
+                    );
+                    if eligible && !fields.contains(&column.field_id) {
+                        fields.push(column.field_id);
+                    }
+                }
+                fields.truncate(statistics.max_columns);
+                fields
+            }
+        };
+        if !statistics.enabled || fields.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(flow_materializer::SketchSelection::of_fields(
+            schema, &fields,
+        )))
+    }
+
     /// The sort keys Flow declares on this target: the configured order, or
     /// the primary key when none is configured. Keyless tables are unsorted.
     pub fn sort_keys(&self) -> Result<Vec<flow_materializer::SortKey>> {
@@ -579,6 +734,15 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.tables.is_empty(), "source and tables are required");
+        let statistics = &self.statistics;
+        ensure!(
+            statistics.max_columns > 0
+                && statistics.refresh_interval_secs > 0
+                && statistics.min_coverage_percent <= 100
+                && (1..=100).contains(&statistics.recompute_percent)
+                && statistics.max_sketch_reads > 0,
+            "invalid [statistics] limits"
+        );
         self.validate_source()
     }
 
@@ -713,6 +877,11 @@ impl Config {
                 .partition_spec(&flow_materializer::iceberg_schema(&table.schema(0))?)
                 .with_context(|| {
                     format!("invalid partition for target table {}", table.target_table)
+                })?;
+            table
+                .sketch_selection(&self.statistics, &table.schema(0))
+                .with_context(|| {
+                    format!("invalid statistics for target table {}", table.target_table)
                 })?;
         }
         Ok(())
@@ -878,6 +1047,109 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn example_statistics_section_documents_the_defaults() {
+        let example = include_str!("../../../examples/flow.toml");
+        let (_, section) = example.split_once("\n# [statistics]\n").unwrap();
+        let keys = section
+            .lines()
+            .take_while(|line| line.starts_with('#'))
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                line.split_once(" = ")
+                    .is_some_and(|(key, _)| key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 8);
+        let documented: Config =
+            toml::from_str(&format!("{example}\n[statistics]\n{}\n", keys.join("\n"))).unwrap();
+        assert_eq!(documented.statistics, Statistics::default());
+        assert!(
+            !valid_config().statistics.enabled,
+            "statistics are off by default"
+        );
+    }
+
+    #[test]
+    fn statistics_select_columns_by_name_or_kind() {
+        use flow_model::{Column, ColumnType};
+        let mut config = valid_config();
+        let column = |field_id, name: &str, data_type| Column {
+            field_id,
+            name: name.into(),
+            data_type,
+            nullable: true,
+        };
+        config.tables[0].columns = vec![
+            column(1, "id", ColumnType::Int64),
+            column(2, "score", ColumnType::Float64),
+            column(3, "payload", ColumnType::String),
+            column(4, "status", ColumnType::String),
+            column(5, "created_at", ColumnType::TimestampTzMicros),
+            column(6, "flag", ColumnType::Bool),
+        ];
+        let fields = |config: &Config| {
+            let table = &config.tables[0];
+            table
+                .sketch_selection(&config.statistics, &table.schema(0))
+                .map(|selection| {
+                    selection.map(|selection| {
+                        selection
+                            .columns
+                            .iter()
+                            .map(|column| column.field_id)
+                            .collect::<Vec<_>>()
+                    })
+                })
+        };
+        assert_eq!(fields(&config).unwrap(), None, "off by default");
+        config.statistics.enabled = true;
+        assert_eq!(fields(&config).unwrap(), Some(vec![1, 3, 4, 5]));
+        config.statistics.max_columns = 2;
+        assert_eq!(fields(&config).unwrap(), Some(vec![1, 3]));
+        config.tables[0].statistics = Some(StatisticsColumns::Columns(vec![
+            "score".into(),
+            "id".into(),
+        ]));
+        assert_eq!(fields(&config).unwrap(), Some(vec![1, 2]), "schema order");
+        config.tables[0].statistics = Some(StatisticsColumns::None);
+        assert_eq!(fields(&config).unwrap(), None);
+        config.statistics.columns = StatisticsColumns::None;
+        config.tables[0].statistics = None;
+        assert_eq!(fields(&config).unwrap(), None);
+        for (columns, error) in [
+            (vec!["missing"], "not a configured column"),
+            (vec!["id", "id"], "twice"),
+            (vec![], "no columns"),
+        ] {
+            config.tables[0].statistics = Some(StatisticsColumns::Columns(
+                columns.into_iter().map(String::from).collect(),
+            ));
+            let message = format!("{:#}", fields(&config).unwrap_err());
+            assert!(message.contains(error), "{message}");
+        }
+        #[derive(Deserialize)]
+        struct Wrapper {
+            statistics: StatisticsColumns,
+        }
+        for (text, parsed) in [
+            ("\"auto\"", Some(StatisticsColumns::Auto)),
+            ("\"none\"", Some(StatisticsColumns::None)),
+            (
+                "[\"id\"]",
+                Some(StatisticsColumns::Columns(vec!["id".into()])),
+            ),
+            ("\"all\"", None),
+        ] {
+            assert_eq!(
+                toml::from_str::<Wrapper>(&format!("statistics = {text}"))
+                    .ok()
+                    .map(|wrapper| wrapper.statistics),
+                parsed
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,7 @@ use crate::{
     arrow::{validated_columns, writer_arrow_schema},
     iceberg_schema,
     sort::{SortSpec, SortVerifier},
+    statistics::{FileSketches, SketchSelection},
 };
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,8 @@ pub struct WriterConfig {
     pub row_group_bytes: usize,
     pub compression: Compression,
     pub artifact_tracker: Option<Arc<dyn ArtifactTracker>>,
+    /// Columns a [`DataWriter`] sketches; see [`DataWriter::with_sketches`].
+    pub sketch: Option<Arc<SketchSelection>>,
 }
 impl Default for WriterConfig {
     fn default() -> Self {
@@ -65,6 +68,7 @@ impl Default for WriterConfig {
             row_group_bytes: 32 * 1024 * 1024,
             compression: Compression::ZSTD(ZstdLevel::default()),
             artifact_tracker: None,
+            sketch: None,
         }
     }
 }
@@ -307,6 +311,8 @@ struct OpenFile {
     /// Whether every row of this file so far was in order.
     sorted: bool,
     last_write: u64,
+    /// Distinct-value sketches of this file's rows, when the writer sketches.
+    sketches: Option<FileSketches>,
 }
 
 /// One file is rotated only between batches, so positions are known as rows are written.
@@ -329,6 +335,7 @@ pub struct DataWriter {
     spec_id: i32,
     partitioner: Option<Partitioner>,
     writes: u64,
+    sketch: Option<Arc<SketchSelection>>,
     arrow_schema: arrow_schema::SchemaRef,
     lineage_schema: Option<arrow_schema::SchemaRef>,
 }
@@ -371,7 +378,12 @@ impl DataWriter {
             spec_id,
             partitioner: None,
             writes: 0,
+            sketch: None,
             lineage_schema: None,
+        })
+        .and_then(|writer| match writer.config.sketch.clone() {
+            Some(selection) => writer.with_sketches(selection),
+            None => Ok(writer),
         })
     }
 
@@ -394,6 +406,31 @@ impl DataWriter {
                     .context("partition spec does not apply to the table schema")?,
             })
         };
+        Ok(self)
+    }
+
+    /// Sketch `selection`'s columns of every file and write each file's
+    /// sketches beside it, as [`crate::sketch_path`] names. Columns are
+    /// matched by field ID, so a selection made for an earlier schema
+    /// sketches the fields this schema still has. Sketching never fails a
+    /// write: a file whose sketches fail is left unsketched.
+    pub fn with_sketches(mut self, selection: Arc<SketchSelection>) -> Result<Self> {
+        ensure!(
+            self.open.is_empty() && self.files.is_empty(),
+            "sketches must be configured before writing"
+        );
+        let fields: Vec<i32> = selection
+            .columns
+            .iter()
+            .map(|column| column.field_id)
+            .collect();
+        let resolved = SketchSelection::of_fields(&self.schema, &fields);
+        let selection = if resolved == *selection {
+            selection
+        } else {
+            Arc::new(resolved)
+        };
+        self.sketch = (!selection.is_empty()).then_some(selection);
         Ok(self)
     }
 
@@ -733,6 +770,7 @@ impl DataWriter {
             verifier: self.sort.as_ref().map(|sort| SortVerifier::new(&sort.spec)),
             sorted: true,
             last_write: 0,
+            sketches: self.sketch.as_deref().map(FileSketches::new),
         });
         Ok(self.open.len() - 1)
     }
@@ -793,6 +831,17 @@ impl DataWriter {
             );
             file.sorted = false;
         }
+        if let (Some(selection), Some(sketches)) = (&self.sketch, &mut file.sketches)
+            && let Err(error) = sketches.update(selection, &columns)
+        {
+            metrics::counter!("flow_statistics_sketch_write_failures_total").increment(1);
+            tracing::warn!(
+                event = "statistics_sketch_write_failed",
+                %error,
+                "data file left unsketched"
+            );
+            file.sketches = None;
+        }
         file.row_group
             .prepare(&mut file.writer, rows, bytes, &self.config)
             .await?;
@@ -849,7 +898,13 @@ impl DataWriter {
             if let Some(order) = order {
                 built.sort_order_id(order);
             }
-            self.files.push(built.build()?);
+            let built = built.build()?;
+            if let Some(mut sketches) = file.sketches.clone() {
+                let (file_io, tracker) =
+                    (self.file_io.clone(), self.config.artifact_tracker.clone());
+                write_sketch(file_io, tracker, built.file_path(), &mut sketches).await;
+            }
+            self.files.push(built);
         }
         Ok(())
     }
@@ -864,6 +919,38 @@ impl DataWriter {
         self.files
             .sort_by(|left, right| left.file_path().cmp(right.file_path()));
         Ok(self.files)
+    }
+}
+
+/// Write a data file's sketches beside it. Sketches are advisory: a failure
+/// is logged and counted, and the data file stays unsketched.
+async fn write_sketch(
+    file_io: FileIO,
+    tracker: Option<Arc<dyn ArtifactTracker>>,
+    data_file: &str,
+    sketches: &mut FileSketches,
+) {
+    let path = crate::sketch_path(data_file);
+    let result = async {
+        if let Some(tracker) = &tracker {
+            tracker
+                .register(ArtifactSet {
+                    paths: vec![path.clone()],
+                    ranges: Vec::new(),
+                })
+                .await?;
+        }
+        crate::statistics::write_sketches(&file_io, &path, sketches, (-1, -1), false).await
+    }
+    .await;
+    if let Err(error) = result {
+        metrics::counter!("flow_statistics_sketch_write_failures_total").increment(1);
+        tracing::warn!(
+            event = "statistics_sketch_write_failed",
+            data_file,
+            error = %error,
+            "data file left unsketched"
+        );
     }
 }
 

@@ -174,6 +174,9 @@ Supported today:
   declared partition spec: change epochs stay unpartitioned and compaction
   rewrites them into the table's partitions. See
   [partitioned tables](docs/partitioning.md).
+- Optional distinct-value statistics for Trino and Spark planners: compaction
+  sketches each data file's columns as it writes them, and maintenance
+  publishes Iceberg statistics files. See [table statistics](docs/statistics.md).
 - The [type mappings](docs/postgres-types.md); JSON and JSONB replicate as
   normalized JSON text.
 - Automatic schema evolution for nullable column additions and compatible

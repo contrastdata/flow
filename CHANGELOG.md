@@ -93,6 +93,21 @@ From earlier development builds of `main`:
 - Configurable spool limits `limits.spool_transactions` and
   `limits.spool_subtransactions`.
 
+**Table statistics**
+
+- Off by default. With `[statistics] enabled = true`, compaction output and
+  the initial copy write a Theta sketch of each selected column beside every
+  data file (CDC epochs are not sketched), and table maintenance publishes
+  their union as an Iceberg statistics file (`apache-datasketches-theta-v1`
+  blobs with `ndv`) on the head snapshot, which Trino and Spark plan queries
+  with. Columns are `"auto"`, `"none"` or a list, per table with
+  `[[tables]] statistics`. Flow moves its entry to the head before history
+  expiration, rebuilds the union once rewritten files held
+  `recompute_percent` of its rows, never changes another writer's
+  statistics, and garbage collection keeps every statistics file the
+  metadata lists. `layout` shows the statistics readers of the head use. See
+  [Table statistics](docs/statistics.md).
+
 **Partitioned tables**
 
 - `[[tables]] partition` (`"none"` or fields such as

@@ -209,6 +209,8 @@ pub struct TablePublisher {
     batch_bytes: usize,
     manifest_cache: ManifestCache,
     read_limits: flow_compactor::ReadLimits,
+    /// Columns each table's initial copy sketches. Ingest epochs never do.
+    sketches: HashMap<flow_model::TableId, Arc<flow_materializer::SketchSelection>>,
 }
 impl TablePublisher {
     pub fn new(
@@ -234,7 +236,18 @@ impl TablePublisher {
             batch_bytes,
             manifest_cache: ManifestCache::new(MANIFEST_CACHE_BYTES),
             read_limits: flow_compactor::ReadLimits::default(),
+            sketches: HashMap::new(),
         })
+    }
+
+    /// Sketch the given columns of each table's initial copy; see
+    /// [`crate::TableMaintenance::with_statistics`].
+    pub fn with_sketches(
+        mut self,
+        sketches: HashMap<flow_model::TableId, Arc<flow_materializer::SketchSelection>>,
+    ) -> Self {
+        self.sketches = sketches;
+        self
     }
 
     /// Bounds for reading indexed original rows whose unchanged values an
@@ -543,6 +556,9 @@ impl TablePublisher {
         let reservation = ownership.record().await?;
         let mut writer_config = self.writer.clone();
         writer_config.artifact_tracker = Some(ownership.clone());
+        if epoch.initial_snapshot {
+            writer_config.sketch = self.sketches.get(&epoch.table).cloned();
+        }
         let operation = PreparedOperation {
             id: epoch.id.clone(),
             table_id: epoch.table,

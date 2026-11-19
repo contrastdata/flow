@@ -12,6 +12,7 @@
 - [Changelog](../CHANGELOG.md) and [security policy](../SECURITY.md).
 - [Iceberg v3](iceberg-v3.md): deletion vectors, upgrades and compatibility checks.
 - [Sorted layout](sorted-layout.md): table sort orders, which files are sorted, and the `layout` command.
+- [Table statistics](statistics.md): Theta sketches of distinct values, published as Iceberg statistics files for query planners.
 - [Partitioned tables](partitioning.md): declared partition specs, unpartitioned ingest, compaction into partitions and spec changes.
 - [Performance](performance.md): recorded throughput, publication latency and reader overhead.
 
