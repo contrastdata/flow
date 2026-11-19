@@ -26,7 +26,70 @@ struct Report {
     sorted_rows_ratio: f64,
     /// The column `overlap` is measured on.
     overlap_column: Option<String>,
+    /// The column statistics readers planning the head use, if any.
+    statistics: Option<Statistics>,
     advice: Vec<String>,
+}
+
+/// A table's statistics file as readers of the head find it: on the head or
+/// its closest ancestor that has one.
+#[derive(serde::Serialize)]
+struct Statistics {
+    path: String,
+    /// Whether Flow published it.
+    flow: bool,
+    /// Commits between the snapshot the blobs describe and the head.
+    commits_behind: i64,
+    /// Estimated distinct values by column.
+    ndv: Vec<(String, u64)>,
+}
+
+fn statistics(
+    table: &Table,
+    listed: &flow_coordinator::ListedStatistics,
+    column: impl Fn(i32) -> String,
+) -> Option<Statistics> {
+    let metadata = table.metadata();
+    let head = metadata.current_snapshot()?;
+    let mut snapshot = Some(head);
+    // Readers stop at the first ancestor that is no longer in the metadata.
+    let file = loop {
+        let current = snapshot?;
+        if let Some(file) = listed
+            .statistics
+            .iter()
+            .find(|file| file.snapshot_id == current.snapshot_id())
+        {
+            break file;
+        }
+        snapshot = current
+            .parent_snapshot_id()
+            .and_then(|parent| metadata.snapshot_by_id(parent));
+    };
+    let described = file
+        .blob_metadata
+        .iter()
+        .map(|blob| blob.sequence_number)
+        .min()
+        .unwrap_or(head.sequence_number());
+    let prefix = format!(
+        "{}/metadata/flow-stats-",
+        metadata.location().trim_end_matches('/')
+    );
+    Some(Statistics {
+        path: file.statistics_path.clone(),
+        flow: file.statistics_path.starts_with(&prefix),
+        commits_behind: head.sequence_number() - described,
+        ndv: file
+            .blob_metadata
+            .iter()
+            .filter(|blob| blob.r#type == "apache-datasketches-theta-v1" && blob.fields.len() == 1)
+            .filter_map(|blob| {
+                let ndv = blob.properties.get("ndv")?.parse().ok()?;
+                Some((column(blob.fields[0]), ndv))
+            })
+            .collect(),
+    })
 }
 
 pub(crate) async fn run(config: &Config, only: Option<&str>, json: bool) -> Result<()> {
@@ -46,7 +109,8 @@ pub(crate) async fn run(config: &Config, only: Option<&str>, json: bool) -> Resu
         let view = SnapshotView::current(&table).await?;
         let layout = flow_coordinator::sort_layout(&table, &view);
         let sort = TableSort::of_table(&configured.schema(0), table.metadata());
-        reports.push(report(name, &table, layout, &sort));
+        let listed = flow_coordinator::listed_statistics(&table).await?;
+        reports.push(report(name, &table, layout, &sort, &listed));
     }
     if let Some(only) = only
         && reports.is_empty()
@@ -63,7 +127,13 @@ pub(crate) async fn run(config: &Config, only: Option<&str>, json: bool) -> Resu
     Ok(())
 }
 
-fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> Report {
+fn report(
+    name: String,
+    table: &Table,
+    layout: SortLayout,
+    sort: &TableSort,
+    listed: &flow_coordinator::ListedStatistics,
+) -> Report {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     let column = |id: i32| {
@@ -156,6 +226,7 @@ fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> 
             column(overlap.field_id)
         ));
     }
+    let statistics = statistics(table, listed, column);
     Report {
         table: name,
         format_version: metadata.format_version() as u8,
@@ -168,6 +239,7 @@ fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> 
             .as_ref()
             .map(|overlap| column(overlap.field_id)),
         layout,
+        statistics,
         advice,
     }
 }
@@ -230,6 +302,29 @@ fn text(report: &Report) -> String {
             out,
             "  lookup       a point lookup on {column} reads at most {:.1}% of rows by file bounds",
             100.0 * overlap.lookup_rows_ratio
+        );
+    }
+    if let Some(statistics) = &report.statistics {
+        let ndv = statistics
+            .ndv
+            .iter()
+            .map(|(column, ndv)| format!("{column} ≈{ndv}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let _ = writeln!(
+            out,
+            "  statistics   {}, {} commits behind the head: {}",
+            if statistics.flow {
+                "Flow"
+            } else {
+                "another writer"
+            },
+            statistics.commits_behind,
+            if ndv.is_empty() {
+                "no distinct counts"
+            } else {
+                &ndv
+            }
         );
     }
     if report.advice.is_empty() {

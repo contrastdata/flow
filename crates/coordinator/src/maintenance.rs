@@ -40,6 +40,8 @@ pub use deletes::{DeleteRepairCursor, DeleteRewritePolicy};
 pub(crate) use demotions::MergeDemotions;
 mod levels;
 mod manifests;
+mod statistics;
+pub use statistics::{ListedStatistics, StatisticsPolicy, StatisticsReport, listed_statistics};
 mod recovery;
 pub(crate) use levels::file_level;
 pub(crate) use recovery::resolve_maintenance_catalog_operation;
@@ -290,6 +292,7 @@ pub struct TableMaintenance {
     garbage: garbage::RetainedIndexes,
     demotions: MergeDemotions,
     conversion: Arc<PartitionConversion>,
+    statistics: Arc<statistics::TableStatistics>,
 }
 
 /// Tables that move files of an earlier partition spec into their current
@@ -351,6 +354,7 @@ impl TableMaintenance {
             garbage: garbage::RetainedIndexes::new(garbage::RETAINED_INDEX_BYTES),
             demotions: MergeDemotions::default(),
             conversion: Arc::default(),
+            statistics: Arc::default(),
         })
     }
 
@@ -637,6 +641,7 @@ impl TableMaintenance {
         .await?;
         let mut writer = self.writer.clone();
         writer.artifact_tracker = Some(ownership.clone());
+        writer.sketch = self.sketch_selection(table_id);
         let read_limits = self.read_limits.clone();
         let cache = self.cache.clone();
         let worker_started = std::time::Instant::now();

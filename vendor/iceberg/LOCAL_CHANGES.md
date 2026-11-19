@@ -83,6 +83,7 @@ patch -p1 < docs/patches/iceberg-debug-redaction.patch
 patch -p1 < docs/patches/iceberg-dv-observed-size.patch
 patch -p1 < docs/patches/iceberg-scan-shared-entry.patch
 patch -p1 < docs/patches/iceberg-parallel-encode.patch
+patch -p1 < docs/patches/iceberg-truncate-large-binary.patch
 ```
 
 The patches include prominent local-modification notices. This provenance file is
@@ -90,6 +91,12 @@ added separately. The crate's original Cargo.lock is omitted because the reposit
 uses its root Cargo.lock. `Cargo.toml.orig` is left as upstream published it; the
 v3 patch's dependency additions apply only to the normalized `Cargo.toml` that
 Cargo builds from. No upstream submission is claimed.
+
+The truncate patch applies `truncate(W)` to Arrow `LargeBinary` arrays, which
+the writer uses for binary columns, as it already did to `Binary`; without it,
+every partitioned write to a spec with `truncate` on a binary column failed.
+Changed file: `src/transform/truncate.rs`. See
+`docs/patches/iceberg-truncate-large-binary.patch`.
 
 The source-nullability patch adds a root-field `make_column_optional(field_id)`
 schema action. It preserves IDs/types/defaults and rejects identifier fields,

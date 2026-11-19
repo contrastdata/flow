@@ -57,6 +57,8 @@ tempfile = "3"
 proptest = "1"
 crc32fast = "1"
 lz4_flex = "0.14"
+# Already built for Iceberg bucket transforms; the Theta hash tests use it as an oracle.
+murmur3 = "0.5.2"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1.1"
 

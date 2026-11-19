@@ -16,6 +16,15 @@ use tokio::sync::Mutex;
 
 const RESERVATION_FILES: u64 = 64;
 
+/// A data file's sketches are its path with this suffix in place of
+/// `.parquet`; see [`flow_materializer::sketch_path`].
+const SKETCH_SUFFIX: &str = ".parquet.sketch.puffin";
+
+/// The range of a prepared plan's `-d<n>.avro` delete manifests.
+fn is_spec_manifests(range: &NumberedArtifacts) -> bool {
+    range.suffix == ".avro" && range.prefix.ends_with("-prepared.avro-d")
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OwnedArtifacts {
     pub table_uuid: uuid::Uuid,
@@ -147,6 +156,18 @@ pub async fn register_catalog_metadata(
         return Ok(());
     }
     register_metadata_path(store, table, table_id, path).await
+}
+
+/// Own one object written outside an operation, such as a statistics file,
+/// before it is written.
+pub(crate) async fn register_owned_path(
+    store: &StateStore,
+    table: &Table,
+    table_id: TableId,
+    path: &str,
+    kind: &str,
+) -> Result<()> {
+    register_metadata_owner(store, table, table_id, path, kind).await
 }
 
 async fn register_metadata_path(
@@ -382,6 +403,15 @@ impl WriterRegistration {
                 digits: 0,
             });
         }
+        // A sketching writer writes each data file's sketches beside it. The
+        // range starts empty; registering a sketch reserves a block. It comes
+        // last: engines before it find the spec manifests at index 2.
+        ranges.push(NumberedArtifacts {
+            prefix: format!("{location}/data/{}-data-", attempt.0),
+            suffix: SKETCH_SUFFIX.into(),
+            count: 0,
+            digits: 6,
+        });
         let owner = OwnedArtifacts::new(
             table,
             table_id,
@@ -407,29 +437,42 @@ impl WriterRegistration {
             bincode::serialize(&*self.owner.lock().await)?,
         ))
     }
-    /// Called only after all writers close. The smaller reservation is persisted
-    /// atomically with Prepared; an interrupted build keeps its full reserved range.
     /// Before writing a plan whose deletes span `specs` partition specs,
     /// reserve its `-d` manifests if the table gained specs since this
     /// registration was created.
     pub(crate) async fn reserve_plan_manifests(&self, specs: usize) -> Result<()> {
         let needed = specs.saturating_sub(1) as u64;
         let mut owner = self.owner.lock().await;
-        let reserved = owner.artifacts.ranges.get(2).map_or(0, |range| range.count);
+        let reserved = owner
+            .artifacts
+            .ranges
+            .iter()
+            .find(|range| is_spec_manifests(range))
+            .map_or(0, |range| range.count);
         if needed <= reserved {
             return Ok(());
         }
         let mut proposed = owner.clone();
-        match proposed.artifacts.ranges.get_mut(2) {
+        match proposed
+            .artifacts
+            .ranges
+            .iter_mut()
+            .find(|range| is_spec_manifests(range))
+        {
             Some(range) => range.count = needed,
             None => {
                 let plan = proposed.artifacts.paths[0].clone();
-                proposed.artifacts.ranges.push(NumberedArtifacts {
-                    prefix: format!("{plan}-d"),
-                    suffix: ".avro".into(),
-                    count: needed,
-                    digits: 0,
-                });
+                // At index 2, after the data and delete ranges, as before
+                // sketch ranges existed.
+                proposed.artifacts.ranges.insert(
+                    2,
+                    NumberedArtifacts {
+                        prefix: format!("{plan}-d"),
+                        suffix: ".avro".into(),
+                        count: needed,
+                        digits: 0,
+                    },
+                );
             }
         }
         let value = bincode::serialize(&proposed)?;
@@ -440,6 +483,8 @@ impl WriterRegistration {
         Ok(())
     }
 
+    /// Called only after all writers close. The smaller reservation is persisted
+    /// atomically with Prepared; an interrupted build keeps its full reserved range.
     /// `spec_manifests` is the count of `-d` plan manifests written.
     pub(crate) async fn finish(
         &self,
@@ -451,7 +496,22 @@ impl WriterRegistration {
         owner.created_ms = now_ms()?;
         owner.artifacts.ranges[0].count = data_count as u64;
         owner.artifacts.ranges[1].count = delete_count as u64;
-        if let Some(range) = owner.artifacts.ranges.get_mut(2) {
+        // A sketching writer may have written one sketch per data file.
+        if let Some(range) = owner
+            .artifacts
+            .ranges
+            .iter_mut()
+            .find(|range| range.suffix == SKETCH_SUFFIX)
+            && range.count > 0
+        {
+            range.count = data_count as u64;
+        }
+        if let Some(range) = owner
+            .artifacts
+            .ranges
+            .iter_mut()
+            .find(|range| is_spec_manifests(range))
+        {
             anyhow::ensure!(
                 spec_manifests as u64 <= range.count,
                 "plan wrote more spec manifests than it reserved"

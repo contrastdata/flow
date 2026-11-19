@@ -1407,7 +1407,7 @@ mod columnar;
 mod live;
 mod merge;
 mod parquet_scan;
-pub use parquet_scan::{ReadLimits, read_positions};
+pub use parquet_scan::{ReadLimits, read_positions, sketch_file};
 mod catchup;
 mod residual;
 pub use catchup::{CatchUpRejected, catch_up};

@@ -1607,10 +1607,13 @@ dependencies = [
  "futures",
  "iceberg",
  "lz4_flex 0.14.0",
+ "metrics",
+ "murmur3",
  "parquet",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -509,12 +509,20 @@ impl TableMaintenance {
             stopped_early || has_unseen_records || report.examined_records < page_records;
         report.examined_objects = candidates.len();
 
+        // A data file's sketches live as long as the data file does. A walk
+        // must look for the data files beside their candidate sketches.
+        let walk_candidates: BTreeSet<String> = candidates
+            .iter()
+            .flat_map(|path| {
+                std::iter::once(path.clone()).chain(sketch_target(path).map(str::to_owned))
+            })
+            .collect();
         let referenced = if candidates.iter().all(|path| is_metadata_json(path)) {
             // JSON-only pages do not require reading any manifests.
             Referenced::Walk(BTreeSet::new())
         } else {
             match self
-                .referenced(&head, &candidates, deadline, &mut report)
+                .referenced(&head, &walk_candidates, deadline, &mut report)
                 .await?
             {
                 Some(referenced) => referenced,
@@ -528,6 +536,13 @@ impl TableMaintenance {
         };
         // Catalog JSON is independent of snapshot expiration. Protect the
         // current pointer and every version the catalog still advertises.
+        // Statistics files are referenced by table metadata, not snapshots;
+        // read them only for a page that holds one.
+        let statistics = if candidates.iter().any(|path| path.ends_with(".stats")) {
+            super::statistics::listed_statistics(&head).await?
+        } else {
+            super::statistics::ListedStatistics::default()
+        };
         let catalog_json: HashSet<&str> = head
             .metadata_location()
             .into_iter()
@@ -537,6 +552,7 @@ impl TableMaintenance {
                     .iter()
                     .map(|entry| entry.metadata_file.as_str()),
             )
+            .chain(statistics.paths())
             .collect();
 
         let store = self.store.clone();
@@ -573,7 +589,10 @@ impl TableMaintenance {
                     policy.grace
                 });
                 let marker = markers.get(&path).copied();
-                if catalog_json.contains(path.as_str()) || referenced.contains(&path) {
+                if catalog_json.contains(path.as_str())
+                    || referenced.contains(&path)
+                    || sketch_target(&path).is_some_and(|data| referenced.contains(data))
+                {
                     // A retained file may stay live long after its upload.
                     // Its next unreferenced observation starts a new grace.
                     if marker.is_some() && observed.insert(path.clone()) {
@@ -801,9 +820,29 @@ impl TableMaintenance {
     }
 }
 
+/// The data file a sketch file describes; see [`flow_materializer::sketch_path`].
+fn sketch_target(path: &str) -> Option<&str> {
+    path.strip_suffix(".sketch.puffin")
+        .filter(|data| data.ends_with(".parquet"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sketches_name_the_data_file_they_describe() {
+        let data = "s3://bucket/table/data/op-data-000001.parquet";
+        assert_eq!(
+            sketch_target(&flow_materializer::sketch_path(data)),
+            Some(data)
+        );
+        assert_eq!(sketch_target(data), None);
+        assert_eq!(
+            sketch_target("s3://bucket/table/data/op-delete-000001.puffin"),
+            None
+        );
+    }
 
     #[test]
     fn one_partial_build_keeps_priority_over_the_budget() {

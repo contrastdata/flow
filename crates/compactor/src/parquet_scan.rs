@@ -517,6 +517,68 @@ pub(crate) async fn read_input_batches(
     Ok(())
 }
 
+/// Sketch the selected columns of an existing data file, reading only their
+/// column chunks under `limits`. Every physical row counts, including rows
+/// a position delete masks: sketches of distinct values are estimates.
+pub async fn sketch_file(
+    file_io: &FileIO,
+    path: &str,
+    selection: &flow_materializer::SketchSelection,
+    batch_rows: usize,
+    limits: &ReadLimits,
+) -> Result<flow_materializer::statistics::FileSketches> {
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    let mut sketches = flow_materializer::statistics::FileSketches::new(selection);
+    let field_ids: Vec<i32> = selection
+        .columns
+        .iter()
+        .map(|column| column.field_id)
+        .collect();
+    // A field the file lacks, as one added after it was written, is null in
+    // every row: its sketch stays empty. Coverage counts rows from table
+    // metadata, so a file with none of the fields needs no read at all.
+    let Some(mut input) = ParquetInput::open_projection(
+        file_io,
+        path,
+        Input::Lazy,
+        Some(&field_ids),
+        false,
+        batch_rows,
+        limits,
+    )
+    .await?
+    else {
+        return Ok(sketches);
+    };
+    // A plain loop rather than a visitor: the future stays `Send` for the
+    // daemon's table actors.
+    while let Some(batch) = input.next_batch().await? {
+        for (index, field) in batch.schema().fields().iter().enumerate() {
+            let Some(field_id) = field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|id| id.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Some(position) = selection
+                .columns
+                .iter()
+                .position(|column| column.field_id == field_id)
+            else {
+                continue;
+            };
+            flow_materializer::statistics::update_sketch(
+                &mut sketches.sketches[position].1,
+                batch.column(index).as_ref(),
+                &selection.columns[position].data_type,
+            )?;
+        }
+        sketches.rows += batch.num_rows() as u64;
+    }
+    Ok(sketches)
+}
+
 type GroupStream = ParquetRecordBatchStream<BoundedReader<ArrowFileReader>>;
 
 /// One Parquet input read one batch at a time, under the same admission
@@ -550,6 +612,23 @@ impl ParquetInput {
         batch_rows: usize,
         limits: &ReadLimits,
     ) -> Result<Self> {
+        Self::open_projection(file_io, path, source, field_ids, true, batch_rows, limits)
+            .await?
+            .context("Parquet projection has no columns")
+    }
+
+    /// Like [`Self::open`], but with `require_all` false the projection is
+    /// the selected fields the file has, as for a file written before a
+    /// field was added; `None` when it has none of them.
+    pub(crate) async fn open_projection(
+        file_io: &FileIO,
+        path: &str,
+        source: Input,
+        field_ids: Option<&[i32]>,
+        require_all: bool,
+        batch_rows: usize,
+        limits: &ReadLimits,
+    ) -> Result<Option<Self>> {
         limits.validate()?;
         ensure!(batch_rows > 0, "Parquet batch row limit must be positive");
         let input = file_io.new_input(path)?;
@@ -583,12 +662,16 @@ impl ParquetInput {
             }
         }
         if let Some(ids) = field_ids {
+            let wanted = ids.iter().copied().collect::<BTreeSet<_>>();
             ensure!(
-                ids.iter().copied().collect::<BTreeSet<_>>() == selected,
+                selected.is_subset(&wanted) && (!require_all || wanted == selected),
                 "Parquet projection field ID is missing"
             );
         }
-        ensure!(!columns.is_empty(), "Parquet projection has no columns");
+        if columns.is_empty() {
+            ensure!(!require_all, "Parquet projection has no columns");
+            return Ok(None);
+        }
         let projection = ProjectionMask::leaves(parquet_schema, columns.iter().copied());
         let expected_rows = u64::try_from(metadata.metadata().file_metadata().num_rows())?;
         let declared_rows =
@@ -604,7 +687,7 @@ impl ParquetInput {
             declared_rows == expected_rows,
             "Parquet row-group counts differ from file metadata"
         );
-        Ok(Self {
+        Ok(Some(Self {
             path: path.to_owned(),
             input,
             source,
@@ -618,7 +701,7 @@ impl ParquetInput {
             group: None,
             total_rows: 0,
             expected_rows,
-        })
+        }))
     }
 
     /// The largest span of selected compressed column chunks in any row group:
