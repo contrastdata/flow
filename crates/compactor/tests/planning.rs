@@ -1416,3 +1416,134 @@ fn per_target_full_size_threshold_scales_down_to_a_quarter_of_a_small_table() {
         1 << 20
     );
 }
+
+/// Small files merge only within their spec and partition, and the
+/// partition with the most sets the debt. A lone small file in each of many
+/// partitions is no debt: nothing could merge it.
+#[test]
+fn small_file_debt_is_counted_per_partition() {
+    let policy = Policy {
+        min_file_age_ms: 0,
+        stable_small_soft_files: 3,
+        stable_small_hard_files: 6,
+        ..Policy::default()
+    };
+    let stable = |id: usize, partition: u8| FileCandidate {
+        level: Level::L1,
+        partition: vec![partition],
+        spec_id: 1,
+        ..file(id, 1 << 20)
+    };
+    let lone: Vec<_> = (0..20).map(|id| stable(id, id as u8)).collect();
+    let debt = policy.debt(&lone).unwrap();
+    assert_eq!(debt.small_files, 1);
+    assert_eq!(debt.pressure, PublicationPressure::Healthy);
+    assert_eq!(policy.plan(1, 0, &lone, &[]).unwrap(), None);
+
+    // Three small files in partition 7 reach the soft limit; their merge
+    // takes no file of another partition.
+    let mut files = lone.clone();
+    files.extend([stable(30, 7), stable(31, 7)]);
+    let debt = policy.debt(&files).unwrap();
+    assert_eq!(debt.small_files, 3);
+    assert_eq!(debt.pressure, PublicationPressure::Delay);
+    let plan = policy.plan(1, 0, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::SmallFiles);
+    assert_eq!(
+        plan.input_files,
+        BTreeSet::from([
+            files[7].id.clone(),
+            files[20].id.clone(),
+            files[21].id.clone()
+        ])
+    );
+    assert_eq!(plan.partition, vec![7]);
+}
+
+/// A rewrite for target deletes writes each partition's rows to that
+/// partition, so one group pays the debt of small carriers in many.
+#[test]
+fn target_delete_rewrites_span_partitions() {
+    let policy = Policy {
+        min_file_age_ms: 0,
+        small_file_target_deletes: 6,
+        ..per_target()
+    };
+    let files: Vec<_> = (0..4)
+        .map(|id| FileCandidate {
+            level: Level::L1,
+            partition: vec![id as u8],
+            spec_id: 1,
+            target_delete_files: 3,
+            delete_file_count: 3,
+            ..file(id, 1 << 20)
+        })
+        .collect();
+    let plan = policy.plan(1, 0, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::TargetDeletes);
+    assert_eq!(plan.input_files.len(), 4);
+}
+
+/// Background conversion takes files outside L0 in other specs, across
+/// their partitions, and leaves files already in the target spec alone.
+#[test]
+fn conversion_selects_only_files_outside_the_target_spec() {
+    let policy = Policy {
+        min_file_age_ms: 0,
+        convert_to_spec: Some(1),
+        ..Policy::default()
+    };
+    let mut files: Vec<_> = (0..3)
+        .map(|id| FileCandidate {
+            level: Level::L2,
+            ..file(id, 256 << 20)
+        })
+        .collect();
+    files.push(FileCandidate {
+        level: Level::L2,
+        spec_id: 1,
+        partition: vec![1],
+        ..file(3, 256 << 20)
+    });
+    let plan = policy.plan(1, 0, &files, &[]).unwrap().unwrap();
+    assert_eq!(plan.reason, PlanReason::Conversion);
+    assert!(!plan.input_files.contains(&files[3].id));
+    assert!(!plan.input_files.is_empty());
+    let lazy = Policy {
+        convert_to_spec: None,
+        ..policy
+    };
+    assert_eq!(lazy.plan(1, 0, &files, &[]).unwrap(), None);
+}
+
+/// A pooled range holds one partition's targets, and only full-size files
+/// of that partition end it.
+#[test]
+fn pooled_ranges_follow_partitions() {
+    let policy = per_target();
+    let candidate = |name: &str, bytes: u64, partition: u8| FileCandidate {
+        id: FileId(name.into()),
+        level: Level::L1,
+        size_bytes: bytes,
+        spec_id: 1,
+        partition: vec![partition],
+        ..file(0, 1)
+    };
+    let full = policy.target_delete_min_file_bytes;
+    let files = vec![
+        candidate("a", 1, 0),
+        candidate("b", full, 1),
+        candidate("c", 1, 0),
+        candidate("d", 1, 1),
+        candidate("e", full, 0),
+        candidate("f", 1, 0),
+    ];
+    let ranges = policy.target_ranges(&files, &BTreeSet::new());
+    let id = |name: &str| FileId(name.into());
+    // A full-size file of another partition lies between: the range goes on.
+    assert!(ranges.continues(&id("a"), &id("c")));
+    // Different partitions never share a file.
+    assert!(!ranges.continues(&id("c"), &id("d")));
+    // A full-size file of the same partition ends it.
+    assert!(!ranges.continues(&id("c"), &id("f")));
+}

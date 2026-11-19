@@ -264,11 +264,6 @@ impl SortVerifier {
         }
     }
 
-    /// Start a new file: the next batch is compared with nothing before it.
-    pub(crate) fn reset(&mut self) {
-        self.last = None;
-    }
-
     /// Whether `columns` continue the order. The columns are a batch in the
     /// writer's column order; a false result leaves the verifier unusable
     /// until [`Self::reset`].
@@ -480,7 +475,7 @@ mod tests {
         );
         assert!(verifier.accept(&batch(&[(2, "y"), (3, "a")])).unwrap());
         assert!(!verifier.accept(&batch(&[(2, "x")])).unwrap());
-        verifier.reset();
+        let mut verifier = SortVerifier::new(&spec);
         assert!(verifier.accept(&batch(&[(2, "x")])).unwrap());
     }
 

@@ -132,7 +132,7 @@ async fn registration_failure_prevents_data_delete_and_catalog_metadata_uploads(
             table.file_io().clone(),
             table.metadata().location(),
             &OperationId(name.into()),
-            0,
+            flow_iceberg_ext::TargetPartitions::uniform(0),
             config.clone(),
         )
         .unwrap()

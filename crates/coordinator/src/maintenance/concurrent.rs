@@ -306,9 +306,12 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, schema.table_id).await?;
-        let mut policy = self
-            .policy
-            .for_table(table.metadata().format_version(), &inventory.files);
+        let mut policy = self.conversion_policy(
+            &table,
+            schema.table_id,
+            self.policy
+                .for_table(table.metadata().format_version(), &inventory.files),
+        );
         if scope.l0_only && policy.data_rewrite_scope != flow_compactor::DataRewriteScope::Disabled
         {
             policy.to_mut().data_rewrite_scope = flow_compactor::DataRewriteScope::L0Only;
@@ -323,6 +326,7 @@ impl TableMaintenance {
         else {
             return Ok(None);
         };
+        self.charge_conversion(schema.table_id, &plan);
         self.demotions.apply(schema.table_id, &mut plan);
         let level = match plan.output_level {
             Level::L0 => "l0",

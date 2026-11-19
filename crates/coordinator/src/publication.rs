@@ -443,6 +443,13 @@ impl TablePublisher {
         let mut data_stage_other = Duration::ZERO;
         let mut delete_write = Duration::ZERO;
         let table = self.catalog.load_table(table.identifier()).await?;
+        let table = crate::partitioning::ensure_ingest_spec(
+            self.catalog.as_ref(),
+            &self.store,
+            table,
+            epoch.table,
+        )
+        .await?;
         if base.format_version != table.metadata().format_version()
             || schema != &captured_schema
             || base.uuid != table.metadata().uuid()
@@ -552,15 +559,22 @@ impl TablePublisher {
             Ok(())
         })
         .await?;
-        let spec_id = table.metadata().default_partition_spec_id();
+        // An initial copy writes the table's target layout directly; ingest
+        // epochs write the unpartitioned spec and compaction partitions them.
+        let data_spec = if epoch.initial_snapshot {
+            crate::partitioning::target_spec(&table)
+        } else {
+            crate::partitioning::ingest_spec(&table)?
+        };
         let mut data_writer = DataWriter::new(
             table.file_io().clone(),
             table.metadata().location(),
             &attempt,
             schema.clone(),
-            spec_id,
+            data_spec.spec_id(),
             writer_config.clone(),
-        )?;
+        )?
+        .with_partition_spec(&data_spec)?;
         if let (Some(spec), Some(mode)) = (sort.spec(), sort_mode) {
             data_writer = data_writer.with_sort(spec, mode)?;
         }
@@ -668,11 +682,12 @@ impl TablePublisher {
         let (removed_deletes, mut priors) = self
             .merge_previous_deletes(&table, schema, epoch, &referenced)
             .await?;
+        let targets = crate::partitioning::current_targets(&table, &self.manifest_cache).await?;
         let mut delete_writer = DeleteWriter::new_for_version(
             table.file_io().clone(),
             table.metadata().location(),
             &attempt,
-            spec_id,
+            targets,
             writer_config.clone(),
             table.metadata().format_version(),
         )?;
@@ -723,7 +738,10 @@ impl TablePublisher {
                 .increment(bytes);
         }
         let path = crate::artifacts::prepared_plan_path(&table, &attempt);
-        write_artifact_plan(&table, &path, &data_files, &delete_files).await?;
+        ownership
+            .reserve_plan_manifests(flow_iceberg_ext::delete_specs(&delete_files))
+            .await?;
+        let spec_manifests = write_artifact_plan(&table, &path, &data_files, &delete_files).await?;
         let properties = HashMap::from([
             ("streaming.writer-id".into(), "embrasure-flow".into()),
             ("streaming.source-id".into(), epoch.source.0.clone()),
@@ -767,6 +785,7 @@ impl TablePublisher {
             .finish(
                 data_files.len(),
                 flow_iceberg_ext::physical_file_stats(&delete_files).0,
+                spec_manifests,
             )
             .await?;
         let store = self.store.clone();

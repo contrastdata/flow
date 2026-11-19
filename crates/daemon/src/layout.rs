@@ -18,6 +18,9 @@ struct Report {
     sort_order: Vec<String>,
     /// `sorted`, `unsorted` or `unsupported`.
     sort_support: &'static str,
+    /// The default partition spec, such as `day(created_at)`; empty when
+    /// unpartitioned.
+    partition: Vec<String>,
     #[serde(flatten)]
     layout: SortLayout,
     sorted_rows_ratio: f64,
@@ -91,7 +94,30 @@ fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> 
             )
         })
         .collect();
+    let partition: Vec<String> = metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|field| {
+            let source = column(field.source_id);
+            match field.transform {
+                Transform::Identity => source,
+                Transform::Bucket(buckets) => format!("bucket({buckets}, {source})"),
+                Transform::Truncate(width) => format!("truncate({width}, {source})"),
+                transform => format!("{transform}({source})"),
+            }
+        })
+        .collect();
     let mut advice = Vec::new();
+    if layout.off_spec_bytes > 0 {
+        advice.push(format!(
+            "{:.2} GiB in {} files outside L0 are in an earlier partition spec. Compaction \
+             moves them as it rewrites them; set partition_convert = \"background\" to move \
+             them sooner.",
+            layout.off_spec_bytes as f64 / f64::from(1u32 << 30),
+            layout.off_spec_files
+        ));
+    }
     let sort_support = match sort {
         TableSort::Unsorted => {
             if schema.identifier_field_ids().next().is_some() {
@@ -135,6 +161,7 @@ fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> 
         format_version: metadata.format_version() as u8,
         sort_order,
         sort_support,
+        partition,
         sorted_rows_ratio: layout.sorted_rows_ratio(),
         overlap_column: layout
             .overlap
@@ -167,6 +194,21 @@ fn text(report: &Report) -> String {
             100.0 * report.sorted_rows_ratio,
             gib(layout.sorted_bytes),
             gib(layout.data_bytes)
+        );
+    }
+    if !report.partition.is_empty() {
+        let _ = writeln!(
+            out,
+            "  partition    {}  (spec {})",
+            report.partition.join(", "),
+            layout.partition_spec_id
+        );
+        let _ = writeln!(
+            out,
+            "  partitions   {}, up to {} files outside L0 each; {:.2} GiB in an earlier spec",
+            layout.partitions,
+            layout.partition_max_files,
+            gib(layout.off_spec_bytes)
         );
     }
     let _ = writeln!(

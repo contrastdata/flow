@@ -1,16 +1,19 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
-use flow_iceberg_ext::ArtifactSet;
+use flow_iceberg_ext::{ArtifactSet, TargetPartitions};
 use flow_model::OperationId;
 use iceberg::{
     compression::CompressionCodec,
     io::FileIO,
     puffin::{Blob, DeleteVector, DeletionVectorLimits, PuffinWriter, encode_deletion_vector},
-    spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Struct},
+    spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion},
 };
 
-use crate::{DeletePosition, WriterConfig, writer::ParquetDeleteWriter};
+use crate::{
+    DeletePosition, WriterConfig,
+    writer::{PooledDeleteWriter, SharingRule},
+};
 
 /// Writes sorted, unique positions in the table's format. V3 keeps one vector
 /// per target, even when batches or requested file rotations split that target.
@@ -19,7 +22,7 @@ pub struct DeleteWriter {
 }
 
 enum Writer {
-    Parquet(Box<ParquetDeleteWriter>),
+    Parquet(Box<PooledDeleteWriter>),
     Puffin(Box<VectorWriter>),
 }
 
@@ -28,35 +31,36 @@ impl DeleteWriter {
         file_io: FileIO,
         location: &str,
         operation: &OperationId,
-        spec_id: i32,
+        targets: TargetPartitions,
         config: WriterConfig,
     ) -> Result<Self> {
         Self::new_for_version(
             file_io,
             location,
             operation,
-            spec_id,
+            targets,
             config,
             FormatVersion::V2,
         )
     }
 
+    /// Each delete is written in its target's spec and partition, as given
+    /// by `targets`.
     pub fn new_for_version(
         file_io: FileIO,
         location: &str,
         operation: &OperationId,
-        spec_id: i32,
+        targets: TargetPartitions,
         config: WriterConfig,
         version: FormatVersion,
     ) -> Result<Self> {
         let inner = match version {
-            FormatVersion::V2 => Writer::Parquet(Box::new(ParquetDeleteWriter::new(
-                file_io, location, operation, spec_id, config,
+            FormatVersion::V2 => Writer::Parquet(Box::new(PooledDeleteWriter::new(
+                file_io, location, operation, targets, config,
             )?)),
             FormatVersion::V3 => {
                 ensure!(
-                    spec_id >= 0
-                        && config.target_file_bytes > 0
+                    config.target_file_bytes > 0
                         && config.row_group_bytes >= 20
                         && config.row_group_rows > 0,
                     "invalid deletion-vector writer limits"
@@ -72,7 +76,7 @@ impl DeleteWriter {
                 Writer::Puffin(Box::new(VectorWriter {
                     file_io,
                     prefix: format!("{}/data/{}", location.trim_end_matches('/'), operation.0),
-                    spec_id,
+                    targets,
                     config,
                     target: None,
                     positions: DeleteVector::default(),
@@ -89,6 +93,21 @@ impl DeleteWriter {
             _ => anyhow::bail!("delete writer requires Iceberg v2 or v3"),
         };
         Ok(Self { inner })
+    }
+
+    /// Start a new position-delete file for a target when `rule` says it
+    /// may not share the open file of its partition with that file's last
+    /// target. Without a rule, each partition's positions share one file
+    /// until [`Self::finish_file`]. Vectors are per target already.
+    pub fn with_sharing(
+        mut self,
+        rule: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        if let Writer::Parquet(writer) = &mut self.inner {
+            let rule: SharingRule = Arc::new(rule);
+            writer.set_sharing(rule);
+        }
+        self
     }
 
     pub async fn write(&mut self, positions: &[impl DeletePosition]) -> Result<()> {
@@ -156,7 +175,7 @@ impl DeleteWriter {
 struct VectorWriter {
     file_io: FileIO,
     prefix: String,
-    spec_id: i32,
+    targets: TargetPartitions,
     config: WriterConfig,
     target: Option<String>,
     positions: DeleteVector,
@@ -194,7 +213,7 @@ impl VectorWriter {
                 let target = position.data_file();
                 let row_position = position.row_position();
                 ensure!(
-                    position.in_spec(self.spec_id) && row_position <= i64::MAX as u64,
+                    row_position <= i64::MAX as u64,
                     "invalid deletion-vector position"
                 );
                 if let Some(previous) = self.target.as_deref() {
@@ -314,13 +333,15 @@ impl VectorWriter {
             let path = self.path();
             let size = self.file_io.new_input(&path)?.metadata().await?.size;
             for (target, offset, length, cardinality) in self.descriptors.drain(..) {
+                // A vector is in its target's spec and partition.
+                let (spec_id, partition) = self.targets.get(&target)?;
                 self.files.push(
                     DataFileBuilder::default()
                         .content(DataContentType::PositionDeletes)
                         .file_path(path.clone())
                         .file_format(DataFileFormat::Puffin)
-                        .partition(Struct::empty())
-                        .partition_spec_id(self.spec_id)
+                        .partition(partition.clone())
+                        .partition_spec_id(spec_id)
                         .record_count(cardinality)
                         .file_size_in_bytes(size)
                         .referenced_data_file(Some(target))

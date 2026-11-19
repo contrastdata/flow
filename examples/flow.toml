@@ -157,6 +157,9 @@ prefetch_file_bytes = 4194304
 # See docs/sorted-layout.md.
 # sort_merge = true
 # merge_memory_bytes = 1073741824
+# Bytes per hour a table with partition_convert = "background" rewrites to move
+# files of an earlier partition spec into its current one.
+# partition_convert_bytes_per_hour = 4294967296
 
 # Optional: replicate the journal and control state to object storage, so a
 # worker and its whole state volume can be replaced without losing changes
@@ -189,6 +192,15 @@ append_only = false
 # Set to "primary_key", "none", or columns such as ["status", "id desc"] to
 # also replace a differing order on an existing table at startup.
 # sort = "primary_key"
+# Iceberg partition spec, never chosen by Flow. Absent: a table Flow creates
+# is unpartitioned and an existing table keeps its own spec. Set to "none" or
+# fields such as ["month(created_at)", "bucket(16, id)"] to also replace a
+# differing spec at startup. Epochs stay unpartitioned; compaction writes the
+# partitions. See docs/partitioning.md.
+# partition = ["month(created_at)"]
+# Files in an earlier spec move as compaction rewrites them ("lazy"), or also
+# by background rewrites within [compaction] partition_convert_bytes_per_hour.
+# partition_convert = "lazy"
 columns = [
   { field_id = 1, name = "id", data_type = "Int64", nullable = false },
   { field_id = 2, name = "status", data_type = "String", nullable = true },

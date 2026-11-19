@@ -27,6 +27,16 @@ pub struct SortLayout {
     /// Overlap of file ranges on the leading sort column (the first
     /// identifier field when the table is unsorted).
     pub overlap: Option<Overlap>,
+    /// The table's default partition spec: its target layout.
+    pub partition_spec_id: i32,
+    /// Distinct partitions of the data files in the default spec.
+    pub partitions: usize,
+    /// The most data files outside L0 in one partition of the default spec.
+    pub partition_max_files: usize,
+    /// Data files and bytes outside L0 in another spec: written before the
+    /// default spec was set, or by another writer.
+    pub off_spec_files: usize,
+    pub off_spec_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -67,10 +77,13 @@ pub fn sort_layout(table: &Table, view: &SnapshotView) -> SortLayout {
         .map(|field| field.source_id)
         .or_else(|| metadata.current_schema().identifier_field_ids().next());
     let data_prefix = format!("{}/data/", metadata.location().trim_end_matches('/'));
+    let spec_id = metadata.default_partition_spec_id();
     let mut layout = SortLayout {
         sort_order_id: order_id,
+        partition_spec_id: spec_id,
         ..SortLayout::default()
     };
+    let mut partitions = std::collections::HashMap::<Vec<u8>, usize>::new();
     let mut ranges = Vec::new();
     let mut without_bounds = 0;
     for entry in view
@@ -90,6 +103,15 @@ pub fn sort_layout(table: &Table, view: &SnapshotView) -> SortLayout {
             Level::L1 => 1,
             Level::L2 => 2,
         }] += 1;
+        if file.partition_spec_id() == spec_id {
+            let files = partitions
+                .entry(flow_iceberg_ext::partition_key(file.partition()))
+                .or_default();
+            *files += usize::from(level != Level::L0);
+        } else if level != Level::L0 {
+            layout.off_spec_files += 1;
+            layout.off_spec_bytes += file.file_size_in_bytes();
+        }
         if sorted_id.is_some() && file.sort_order_id() == sorted_id {
             layout.sorted_files += 1;
             layout.sorted_rows += file.record_count();
@@ -110,6 +132,8 @@ pub fn sort_layout(table: &Table, view: &SnapshotView) -> SortLayout {
         }
     }
     layout.overlap = field_id.map(|field_id| overlap(field_id, ranges, without_bounds));
+    layout.partitions = partitions.len();
+    layout.partition_max_files = partitions.values().copied().max().unwrap_or(0);
     layout
 }
 

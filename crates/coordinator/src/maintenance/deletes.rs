@@ -183,12 +183,7 @@ impl TableMaintenance {
                 })
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|entry| {
-            (
-                flow_iceberg_ext::delete_content_size(&entry.data_file),
-                entry.file_path(),
-            )
-        });
+        worst_partition_first(&mut candidates);
         let mut input_bytes = 0u64;
         let mut input_rows = 0u64;
         let mut sequence = 0;
@@ -376,7 +371,10 @@ impl TableMaintenance {
                     worker_table.file_io().clone(),
                     worker_table.metadata().location(),
                     &worker_id,
-                    worker_table.metadata().default_partition_spec_id(),
+                    flow_iceberg_ext::TargetPartitions::of_view(
+                        worker_table.metadata(),
+                        &worker_view,
+                    ),
                     writer_config,
                     worker_table.metadata().format_version(),
                 )?;
@@ -554,12 +552,16 @@ impl TableMaintenance {
                 None => shared.push((id, entry)),
             }
         }
-        shared.sort_by_key(|(_, entry)| {
-            (
-                flow_iceberg_ext::delete_content_size(&entry.data_file),
-                entry.file_path(),
-            )
-        });
+        {
+            let mut entries: Vec<_> = shared.iter().map(|(_, entry)| *entry).collect();
+            worst_partition_first(&mut entries);
+            let order: HashMap<_, _> = entries
+                .iter()
+                .enumerate()
+                .map(|(rank, entry)| (entry.file_path().to_owned(), rank))
+                .collect();
+            shared.sort_by_key(|(_, entry)| order[entry.file_path()]);
+        }
         let mut input_bytes = 0u64;
         let mut input_rows = 0u64;
         let mut selected = BTreeSet::new();
@@ -698,32 +700,30 @@ impl TableMaintenance {
                     scanned_rows += rows;
                     Some(positions)
                 };
-                let mut writer = DeleteWriter::new_for_version(
+                let writer = DeleteWriter::new_for_version(
                     worker_table.file_io().clone(),
                     worker_table.metadata().location(),
                     &worker_id,
-                    worker_table.metadata().default_partition_spec_id(),
+                    flow_iceberg_ext::TargetPartitions::of_view(
+                        worker_table.metadata(),
+                        &worker_view,
+                    ),
                     writer_config,
                     worker_table.metadata().format_version(),
                 )?;
+                // Each partition's positions pool into one file until a
+                // full-size target, which gets its own.
+                let ranges = worker_ranges.clone();
+                let mut writer = writer.with_sharing(move |previous, next| {
+                    ranges.continues(&FileId(previous.to_owned()), &FileId(next.to_owned()))
+                });
                 let mut batch = Vec::with_capacity(batch_rows);
-                let mut target = None::<&FileId>;
                 for (data_file, position) in merge_positions(
                     positions.iter(),
                     merged_positions
                         .iter()
                         .flat_map(|positions| positions.iter()),
                 ) {
-                    if target != Some(data_file) {
-                        if let Some(previous) = target
-                            && !worker_ranges.continues(previous, data_file)
-                        {
-                            writer.write(&batch).await?;
-                            batch.clear();
-                            writer.finish_target().await?;
-                        }
-                        target = Some(data_file);
-                    }
                     batch.push((data_file.0.as_str(), position));
                     if batch.len() == batch_rows {
                         writer.write(&batch).await?;
@@ -835,7 +835,10 @@ impl TableMaintenance {
             started,
         } = stats;
         let path = crate::artifacts::prepared_plan_path(table, &id);
-        write_artifact_plan(table, &path, &[], &output).await?;
+        ownership
+            .reserve_plan_manifests(flow_iceberg_ext::delete_specs(&output))
+            .await?;
+        let spec_manifests = write_artifact_plan(table, &path, &[], &output).await?;
         let payload = serde_json::to_vec(&RewriteRecovery {
             output_data_sequence: None,
             base,
@@ -863,7 +866,7 @@ impl TableMaintenance {
             .chain(std::iter::once(path))
             .collect();
         let (output_files, output_bytes) = flow_iceberg_ext::physical_file_stats(&output);
-        let reservation = ownership.finish(0, output_files).await?;
+        let reservation = ownership.finish(0, output_files, spec_manifests).await?;
         let store = self.store.clone();
         let operation_id = id.clone();
         blocking(move || {
@@ -1002,6 +1005,32 @@ fn delete_file_debt(
         shared,
         single,
     }
+}
+
+/// Order delete files smallest first within their spec and partition, the
+/// partition with the most files first. Delete-file debt is counted per
+/// partition, and a merge pays it only within one; an unpartitioned table
+/// keeps smallest-first order.
+fn worst_partition_first(entries: &mut [&iceberg::spec::ManifestEntryRef]) {
+    let key = |entry: &iceberg::spec::ManifestEntryRef| {
+        (
+            entry.data_file.partition_spec_id(),
+            flow_iceberg_ext::partition_key(entry.data_file.partition()),
+        )
+    };
+    let mut counts = HashMap::<(i32, Vec<u8>), usize>::new();
+    for entry in entries.iter() {
+        *counts.entry(key(entry)).or_default() += 1;
+    }
+    entries.sort_by_cached_key(|entry| {
+        let partition = key(entry);
+        (
+            std::cmp::Reverse(counts[&partition]),
+            partition,
+            flow_iceberg_ext::delete_content_size(&entry.data_file),
+            entry.file_path().to_owned(),
+        )
+    });
 }
 
 /// The lower and upper `file_path` bounds of a position-delete file.

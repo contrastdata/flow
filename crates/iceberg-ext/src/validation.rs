@@ -87,9 +87,6 @@ impl CommitBase {
         ) {
             return Err(invalid("row deltas and rewrites require Iceberg v2 or v3"));
         }
-        if !metadata.default_partition_spec().fields().is_empty() {
-            return Err(invalid("only unpartitioned tables are supported"));
-        }
         if metadata.table_properties()?.encryption_key_id.is_some() {
             return Err(invalid("encrypted writes are not supported"));
         }

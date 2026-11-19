@@ -202,6 +202,11 @@ impl DataFile {
     pub fn partition(&self) -> &Struct {
         &self.partition
     }
+    /// Get the ID of the partition spec the file's partition values belong to.
+    /// Files read from a manifest carry that manifest's spec ID.
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
     /// Get the record count in the data file.
     pub fn record_count(&self) -> u64 {
         self.record_count

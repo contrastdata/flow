@@ -101,7 +101,8 @@ impl OwnedArtifacts {
     }
 }
 /// Manifest list of an attempt's prepared plan. Its manifests append `-m0.avro`
-/// (data) and `-m1.avro` (deletes).
+/// (data) and `-m1.avro` (deletes), and `-d0.avro`, `-d1.avro` ... for deletes
+/// in further partition specs.
 pub(crate) fn prepared_plan_path(table: &Table, attempt: &OperationId) -> String {
     format!(
         "{}/metadata/{}-prepared.avro",
@@ -355,6 +356,32 @@ impl WriterRegistration {
     ) -> Result<Arc<Self>> {
         let location = table.metadata().location().trim_end_matches('/');
         let plan = prepared_plan_path(table, attempt);
+        let mut ranges: Vec<_> = ["data", "delete"]
+            .into_iter()
+            .map(|kind| NumberedArtifacts {
+                prefix: format!("{location}/data/{}-{kind}-", attempt.0),
+                suffix: if kind == "delete"
+                    && table.metadata().format_version() == iceberg::spec::FormatVersion::V3
+                {
+                    ".puffin"
+                } else {
+                    ".parquet"
+                }
+                .into(),
+                count: RESERVATION_FILES,
+                digits: 6,
+            })
+            .collect();
+        // Deletes in further specs need their own plan manifests.
+        let spec_manifests = flow_iceberg_ext::plan_delete_manifests(table) as u64;
+        if spec_manifests > 0 {
+            ranges.push(NumberedArtifacts {
+                prefix: format!("{plan}-d"),
+                suffix: ".avro".into(),
+                count: spec_manifests,
+                digits: 0,
+            });
+        }
         let owner = OwnedArtifacts::new(
             table,
             table_id,
@@ -365,22 +392,7 @@ impl WriterRegistration {
                     format!("{plan}-m0.avro"),
                     format!("{plan}-m1.avro"),
                 ],
-                ranges: ["data", "delete"]
-                    .into_iter()
-                    .map(|kind| NumberedArtifacts {
-                        prefix: format!("{location}/data/{}-{kind}-", attempt.0),
-                        suffix: if kind == "delete"
-                            && table.metadata().format_version() == iceberg::spec::FormatVersion::V3
-                        {
-                            ".puffin"
-                        } else {
-                            ".parquet"
-                        }
-                        .into(),
-                        count: RESERVATION_FILES,
-                        digits: 6,
-                    })
-                    .collect(),
+                ranges,
             },
         )?;
         Ok(Arc::new(Self {
@@ -397,15 +409,57 @@ impl WriterRegistration {
     }
     /// Called only after all writers close. The smaller reservation is persisted
     /// atomically with Prepared; an interrupted build keeps its full reserved range.
+    /// Before writing a plan whose deletes span `specs` partition specs,
+    /// reserve its `-d` manifests if the table gained specs since this
+    /// registration was created.
+    pub(crate) async fn reserve_plan_manifests(&self, specs: usize) -> Result<()> {
+        let needed = specs.saturating_sub(1) as u64;
+        let mut owner = self.owner.lock().await;
+        let reserved = owner.artifacts.ranges.get(2).map_or(0, |range| range.count);
+        if needed <= reserved {
+            return Ok(());
+        }
+        let mut proposed = owner.clone();
+        match proposed.artifacts.ranges.get_mut(2) {
+            Some(range) => range.count = needed,
+            None => {
+                let plan = proposed.artifacts.paths[0].clone();
+                proposed.artifacts.ranges.push(NumberedArtifacts {
+                    prefix: format!("{plan}-d"),
+                    suffix: ".avro".into(),
+                    count: needed,
+                    digits: 0,
+                });
+            }
+        }
+        let value = bincode::serialize(&proposed)?;
+        let key = self.key.clone();
+        let store = self.store.clone();
+        blocking(move || Ok(store.put_source_transaction(&key, &value)?)).await?;
+        *owner = proposed;
+        Ok(())
+    }
+
+    /// `spec_manifests` is the count of `-d` plan manifests written.
     pub(crate) async fn finish(
         &self,
         data_count: usize,
         delete_count: usize,
+        spec_manifests: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut owner = self.owner.lock().await;
         owner.created_ms = now_ms()?;
         owner.artifacts.ranges[0].count = data_count as u64;
         owner.artifacts.ranges[1].count = delete_count as u64;
+        if let Some(range) = owner.artifacts.ranges.get_mut(2) {
+            anyhow::ensure!(
+                spec_manifests as u64 <= range.count,
+                "plan wrote more spec manifests than it reserved"
+            );
+            range.count = spec_manifests as u64;
+        } else {
+            anyhow::ensure!(spec_manifests == 0, "plan spec manifests were not reserved");
+        }
         if delete_count == 0 {
             owner.artifacts.paths.remove(2);
         }

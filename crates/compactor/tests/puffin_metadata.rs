@@ -207,7 +207,7 @@ impl Fixture {
                 io.clone(),
                 "s3://warehouse/table",
                 &OperationId(format!("group-{group}")),
-                0,
+                flow_iceberg_ext::TargetPartitions::uniform(0),
                 WriterConfig::default(),
                 FormatVersion::V3,
             )
@@ -796,7 +796,7 @@ async fn shared_puffin_preparation_benchmark() {
                 FileIO::new_with_memory(),
                 "memory://rewrite",
                 &OperationId("epoch".into()),
-                0,
+                flow_iceberg_ext::TargetPartitions::uniform(0),
                 WriterConfig::default(),
                 FormatVersion::V3,
             )

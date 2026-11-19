@@ -118,6 +118,53 @@ pub struct Table {
     /// Set: Flow also replaces a differing order on an existing table.
     #[serde(default)]
     pub sort: Option<SortSetting>,
+    /// The target's Iceberg partition spec: `"none"` or a list of fields such
+    /// as `"day(created_at)"`, `"bucket(16, id)"` or `"region"`. Absent: a
+    /// table Flow creates is unpartitioned and an existing table keeps its
+    /// own spec. Set: Flow also replaces a differing spec on an existing table.
+    #[serde(default)]
+    pub partition: Option<PartitionSetting>,
+    /// How files written in an earlier spec reach the current one.
+    #[serde(default)]
+    pub partition_convert: PartitionConvert,
+}
+
+/// A configured partition spec: `"none"`, or a list of partition fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartitionSetting {
+    Unpartitioned,
+    Fields(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for PartitionSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Fields(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Name(name) if name == "none" => Ok(Self::Unpartitioned),
+            Raw::Name(_) => Err(serde::de::Error::custom(
+                "partition must be \"none\" or a list of fields",
+            )),
+            Raw::Fields(fields) => Ok(Self::Fields(fields)),
+        }
+    }
+}
+
+/// How data files written in an earlier partition spec reach the current
+/// one. Either way, new data and every rewrite use the current spec.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionConvert {
+    /// Only when compaction rewrites them for its own reasons.
+    #[default]
+    Lazy,
+    /// Also by background rewrites, within
+    /// `[compaction] partition_convert_bytes_per_hour`.
+    Background,
 }
 
 /// A configured sort order: `"primary_key"`, `"none"`, or a list of
@@ -160,6 +207,65 @@ fn default_format_version() -> iceberg::spec::FormatVersion {
     iceberg::spec::FormatVersion::V2
 }
 
+/// Parse one partition field: `column`, `identity(column)`, `year(column)`,
+/// `month(column)`, `day(column)`, `hour(column)`, `bucket(N, column)` or
+/// `truncate(W, column)`.
+fn partition_field(field: &str) -> Result<(iceberg::spec::Transform, &str)> {
+    use iceberg::spec::Transform;
+    let field = field.trim();
+    let Some((name, rest)) = field.split_once('(') else {
+        ensure!(
+            !field.is_empty() && !field.contains([')', ',', ' ']),
+            "partition field {field:?} must be a column or transform(column)"
+        );
+        return Ok((Transform::Identity, field));
+    };
+    let arguments = rest
+        .strip_suffix(')')
+        .with_context(|| format!("partition field {field:?} lacks a closing parenthesis"))?;
+    let arguments: Vec<&str> = arguments.split(',').map(str::trim).collect();
+    let width = |value: &str| {
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|width| *width > 0)
+            .with_context(|| format!("partition field {field:?} needs a positive width"))
+    };
+    let (transform, column) = match (name.trim().to_lowercase().as_str(), &arguments[..]) {
+        ("identity", [column]) => (Transform::Identity, *column),
+        ("year" | "years", [column]) => (Transform::Year, *column),
+        ("month" | "months", [column]) => (Transform::Month, *column),
+        ("day" | "days", [column]) => (Transform::Day, *column),
+        ("hour" | "hours", [column]) => (Transform::Hour, *column),
+        ("bucket", [buckets, column]) => (Transform::Bucket(width(buckets)?), *column),
+        ("truncate", [width_text, column]) => (Transform::Truncate(width(width_text)?), *column),
+        _ => bail!(
+            "partition field {field:?} must be column, identity, year, month, day, hour, \
+             bucket(N, column) or truncate(W, column)"
+        ),
+    };
+    ensure!(
+        !column.is_empty() && !column.contains(' '),
+        "partition field {field:?} names no column"
+    );
+    Ok((transform, column))
+}
+
+/// Iceberg's conventional partition field names, as Spark and Java assign.
+fn partition_field_name(column: &str, transform: &iceberg::spec::Transform) -> String {
+    use iceberg::spec::Transform;
+    match transform {
+        Transform::Identity => column.to_owned(),
+        Transform::Bucket(_) => format!("{column}_bucket"),
+        Transform::Truncate(_) => format!("{column}_trunc"),
+        Transform::Year => format!("{column}_year"),
+        Transform::Month => format!("{column}_month"),
+        Transform::Day => format!("{column}_day"),
+        Transform::Hour => format!("{column}_hour"),
+        other => format!("{column}_{other}"),
+    }
+}
+
 impl Table {
     /// The sort keys Flow declares on this target: the configured order, or
     /// the primary key when none is configured. Keyless tables are unsorted.
@@ -189,6 +295,39 @@ impl Table {
                 Ok(keys)
             }
         }
+    }
+
+    /// The partition spec Flow declares on this target, bound to `schema`:
+    /// `None` when unconfigured, an unpartitioned spec for `"none"`.
+    pub fn partition_spec(
+        &self,
+        schema: &iceberg::spec::Schema,
+    ) -> Result<Option<iceberg::spec::PartitionSpec>> {
+        let fields = match &self.partition {
+            None => return Ok(None),
+            Some(PartitionSetting::Unpartitioned) => &[][..],
+            Some(PartitionSetting::Fields(fields)) => {
+                ensure!(
+                    !fields.is_empty(),
+                    "partition lists no fields; use \"none\""
+                );
+                &fields[..]
+            }
+        };
+        let mut builder = iceberg::spec::PartitionSpec::builder(schema.clone());
+        for field in fields {
+            let (transform, column) = partition_field(field)?;
+            ensure!(
+                self.columns
+                    .iter()
+                    .any(|configured| configured.name == column),
+                "partition column {column:?} is not a configured column"
+            );
+            builder = builder
+                .add_partition_field(column, partition_field_name(column, &transform), transform)
+                .with_context(|| format!("invalid partition field {field:?}"))?;
+        }
+        Ok(Some(builder.build().context("invalid partition spec")?))
     }
 
     /// Parse `column [asc|desc] [nulls first|nulls last]`. As in Iceberg and
@@ -570,6 +709,11 @@ impl Config {
             table
                 .sort_keys()
                 .with_context(|| format!("invalid sort for target table {}", table.target_table))?;
+            table
+                .partition_spec(&flow_materializer::iceberg_schema(&table.schema(0))?)
+                .with_context(|| {
+                    format!("invalid partition for target table {}", table.target_table)
+                })?;
         }
         Ok(())
     }
@@ -676,7 +820,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 33);
+        assert_eq!(keys.len(), 34);
         let documented: Config =
             toml::from_str(&format!("{example}\n[compaction]\n{}\n", keys.join("\n"))).unwrap();
         assert_eq!(
@@ -733,6 +877,91 @@ mod tests {
                 "{example}\n[compaction]\ndelete_layout = \"vector\"\n"
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn partition_is_declared_only_and_parses_iceberg_transforms() {
+        use iceberg::spec::Transform;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            partition: PartitionSetting,
+        }
+        let with = |partition: Option<&str>| {
+            let mut config = valid_config();
+            config.tables[0].partition = partition.map(|partition| {
+                toml::from_str::<Wrapper>(&format!("partition = {partition}"))
+                    .unwrap()
+                    .partition
+            });
+            config
+        };
+        let spec = |config: &Config| {
+            let table = &config.tables[0];
+            table.partition_spec(&flow_materializer::iceberg_schema(&table.schema(0)).unwrap())
+        };
+        // Absent: Flow neither chooses nor changes a spec.
+        assert!(spec(&with(None)).unwrap().is_none());
+        assert!(
+            spec(&with(Some("\"none\"")))
+                .unwrap()
+                .unwrap()
+                .is_unpartitioned()
+        );
+        let declared = with(Some(
+            r#"["status", "bucket(16, id)", "truncate(4, status)"]"#,
+        ));
+        assert!(declared.validate().is_ok());
+        let fields: Vec<_> = spec(&declared)
+            .unwrap()
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|field| (field.source_id, field.name.clone(), field.transform))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                (2, "status".into(), Transform::Identity),
+                (1, "id_bucket".into(), Transform::Bucket(16)),
+                (2, "status_trunc".into(), Transform::Truncate(4)),
+            ]
+        );
+        assert_eq!(
+            partition_field(" Day( created_at ) ").unwrap(),
+            (Transform::Day, "created_at")
+        );
+        assert_eq!(
+            partition_field("months(created_at)").unwrap(),
+            (Transform::Month, "created_at")
+        );
+        for invalid in [
+            r#"["missing"]"#,
+            r#"["bucket(0, id)"]"#,
+            r#"["bucket(id)"]"#,
+            r#"["day(status)"]"#,
+            r#"["zorder(id)"]"#,
+            r#"["status", "status"]"#,
+            "[]",
+        ] {
+            assert!(
+                with(Some(invalid)).validate().is_err(),
+                "{invalid} was accepted"
+            );
+        }
+        assert!(toml::from_str::<Wrapper>("partition = \"auto\"").is_err());
+        let mut background = valid_config();
+        assert_eq!(
+            background.tables[0].partition_convert,
+            PartitionConvert::Lazy
+        );
+        background.tables[0].partition_convert = toml::from_str::<
+            std::collections::HashMap<String, PartitionConvert>,
+        >("c = \"background\"")
+        .unwrap()["c"];
+        assert_eq!(
+            background.tables[0].partition_convert,
+            PartitionConvert::Background
         );
     }
 

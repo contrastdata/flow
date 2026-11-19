@@ -3,7 +3,7 @@
 Set `format_version = 3` in a `[[tables]]` configuration block to create a v3
 target. The default remains v2 for reader compatibility. Existing targets use
 their catalog format; changing configuration does not upgrade an existing table.
-Both modes currently require unpartitioned tables; both support
+Both modes support [partition specs](partitioning.md) and
 [sort orders](sorted-layout.md).
 
 V3 stores position deletes as compressed bitmaps in standard Puffin deletion

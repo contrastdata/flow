@@ -48,7 +48,7 @@ pub async fn delete(
         table.file_io().clone(),
         table.metadata().location(),
         &OperationId(id.into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig::default(),
     )
     .unwrap();

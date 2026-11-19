@@ -99,10 +99,25 @@ impl RewriteManifestsAction {
         let mut input_count = 0;
         let mut input_bytes = 0_u64;
         let mut input_entries = 0_u64;
-        for content in [ManifestContentType::Data, ManifestContentType::Deletes] {
+        // A manifest holds one content type and one spec's partition tuples.
+        let specs: BTreeSet<i32> = manifests
+            .iter()
+            .map(|manifest| manifest.partition_spec_id)
+            .collect();
+        for (content, spec_id) in [ManifestContentType::Data, ManifestContentType::Deletes]
+            .into_iter()
+            .flat_map(|content| specs.iter().map(move |spec_id| (content, *spec_id)))
+        {
+            if table.metadata().partition_spec_by_id(spec_id).is_none() {
+                return Err(invalid(format!(
+                    "manifest names unknown partition spec {spec_id}"
+                )));
+            }
             let mut candidates: Vec<_> = manifests
                 .iter()
-                .filter(|manifest| manifest.content == content)
+                .filter(|manifest| {
+                    manifest.content == content && manifest.partition_spec_id == spec_id
+                })
                 .collect();
             candidates.sort_by(|a, b| {
                 a.manifest_length
@@ -113,11 +128,6 @@ impl RewriteManifestsAction {
             let mut group_bytes = 0_u64;
             let mut group_entries = 0_u64;
             for manifest in candidates {
-                if manifest.partition_spec_id != base.spec_id {
-                    return Err(invalid(
-                        "manifest rewrite requires the current unpartitioned spec",
-                    ));
-                }
                 let bytes = u64::try_from(manifest.manifest_length)
                     .map_err(|_| invalid("negative manifest length"))?;
                 let entries = manifest
@@ -239,6 +249,7 @@ impl RewriteManifestsAction {
                 &self.root,
                 index,
                 first.content,
+                first.partition_spec_id,
                 true,
             )?;
             let mut live_entries = 0_u64;
@@ -247,7 +258,7 @@ impl RewriteManifestsAction {
                     .get(path.as_str())
                     .ok_or_else(|| invalid("manifest rewrite input disappeared"))?;
                 if manifest.content != first.content
-                    || manifest.partition_spec_id != self.base.spec_id
+                    || manifest.partition_spec_id != first.partition_spec_id
                 {
                     return Err(invalid("manifest group mixes content or partition specs"));
                 }

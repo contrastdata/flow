@@ -55,8 +55,8 @@ From earlier development builds of `main`:
 
 **Capture and publication**
 
-- Initial COPY and PostgreSQL 14–18 logical replication into unpartitioned
-  Iceberg v2 and v3 tables through an Iceberg REST catalog, with a durable
+- Initial COPY and PostgreSQL 14–18 logical replication into Iceberg v2 and v3
+  tables through an Iceberg REST catalog, with a durable
   journal, persistent row index, background compaction and reconciliation of
   external maintenance.
 - Independent per-table publication, so a failing table does not stop the
@@ -85,6 +85,23 @@ From earlier development builds of `main`:
   `limits.epoch_max_transactions` also caps source transactions per epoch.
 - Configurable spool limits `limits.spool_transactions` and
   `limits.spool_subtransactions`.
+
+**Partitioned tables**
+
+- `[[tables]] partition` (`"none"` or fields such as
+  `["month(created_at)", "bucket(16, id)"]`) declares a target's partition
+  spec; without it a table keeps the spec set from SQL. Flow never chooses a
+  spec. CDC epochs write an unpartitioned spec, which Flow adds beside a
+  partitioned default when needed; the initial copy and every rewrite write
+  the default spec, one file per partition; position deletes and deletion
+  vectors are written in their target's spec and partition. Files of an
+  earlier spec move when compaction rewrites them, or also in the background
+  with `partition_convert = "background"` within
+  `[compaction] partition_convert_bytes_per_hour`. Small-file and shared
+  delete-file debt are counted per partition. `layout` and
+  `flow_table_partition_spec_id`, `flow_table_partitions`,
+  `flow_table_partition_max_files` and `flow_table_off_spec_bytes` report the
+  layout. See [Partitioned tables](docs/partitioning.md).
 
 **Iceberg v3**
 

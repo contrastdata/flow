@@ -129,3 +129,9 @@ prepared artifacts, which must never replace an earlier attempt's file, in
 place of a separate existence check before each write. Changed files:
 `src/io/file_io.rs` and `src/io/storage/mod.rs`. See
 `docs/patches/iceberg-conditional-create.patch`.
+
+The partition-spec accessor patch adds `DataFile::partition_spec_id()`. Files
+read from a manifest carry that manifest's spec ID, and the builder already sets
+it; Flow reads it to write position deletes in each target file's own spec and
+to group manifests by spec when a table has files in several specs. Changed
+file: `src/spec/manifest/data_file.rs`.
