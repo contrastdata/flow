@@ -238,16 +238,16 @@ impl SnapshotView {
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| invalid(format!("snapshot {snapshot_id} is not retained")))?;
         let manifests = cache.manifest_list(table, snapshot).await?.to_vec();
-        if !table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .is_empty()
-            || manifests.iter().any(|manifest| {
-                manifest.partition_spec_id != table.metadata().default_partition_spec_id()
-            })
-        {
-            return Err(invalid("only the current unpartitioned spec is supported"));
+        if let Some(manifest) = manifests.iter().find(|manifest| {
+            table
+                .metadata()
+                .partition_spec_by_id(manifest.partition_spec_id)
+                .is_none()
+        }) {
+            return Err(invalid(format!(
+                "manifest {} names unknown partition spec {}",
+                manifest.manifest_path, manifest.partition_spec_id
+            )));
         }
         let loaded: Vec<_> = stream::iter(manifests.iter().cloned())
             .map(|manifest| async move {
@@ -372,12 +372,13 @@ pub fn exact_delete_target(file: &DataFile) -> Option<String> {
     })
 }
 
-/// The v2 position-delete applicability rules for the supported single spec: matching partition, an
-/// equal or newer data sequence, and matching file path where known. Bounds
+/// The v2 position-delete applicability rules: the same spec and partition,
+/// an equal or newer data sequence, and matching file path where known. Bounds
 /// are only used for exclusion, so truncated bounds remain conservative.
 pub fn position_delete_may_apply(delete: &ManifestEntry, data: &ManifestEntry) -> bool {
     if delete.content_type() != DataContentType::PositionDeletes
         || data.content_type() != DataContentType::Data
+        || delete.data_file.partition_spec_id() != data.data_file.partition_spec_id()
         || delete.data_file.partition() != data.data_file.partition()
         || matches!((delete.sequence_number, data.sequence_number), (Some(d), Some(a)) if d < a)
     {

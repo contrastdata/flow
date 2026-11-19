@@ -1,17 +1,21 @@
 use anyhow::{Context, Result, ensure};
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray, cast::AsArray,
+    Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    cast::AsArray,
 };
-use flow_iceberg_ext::{ArtifactSet, ArtifactTracker};
+use flow_iceberg_ext::{ArtifactSet, ArtifactTracker, TargetPartitions};
 use flow_model::{
     ColumnType, FileId, OperationId, PgLsn, Row, RowLocation, TableSchema, Value, fingerprint,
 };
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use iceberg::{
-    arrow::schema_to_arrow_schema,
+    arrow::{PartitionValueCalculator, arrow_struct_to_literal, schema_to_arrow_schema},
     io::FileIO,
     metadata_columns::{RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS},
-    spec::{DataContentType, DataFile, Datum, NestedField, PrimitiveType, Schema, Struct, Type},
+    spec::{
+        DataContentType, DataFile, Datum, Literal, NestedField, PartitionSpec, PrimitiveType,
+        Schema, Struct, Type,
+    },
     writer::{
         CurrentFileStatus,
         file_writer::{FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder},
@@ -21,7 +25,14 @@ use parquet::{
     basic::{Compression, ZstdLevel},
     file::properties::{EnabledStatistics, WriterProperties},
 };
-use std::{borrow::Borrow, sync::Arc};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+};
 
 use crate::{
     arrow::{validated_columns, writer_arrow_schema},
@@ -173,13 +184,11 @@ fn batch_row_bytes(schema: &TableSchema, batch: &RecordBatch) -> Result<Vec<usiz
 }
 
 /// One position for a delete writer: an owned [`RowLocation`], or a borrowed
-/// `(data file path, row position)` pair already in the writer's spec, which
-/// avoids an owned path per position.
+/// `(data file path, row position)` pair, which avoids an owned path per
+/// position. The writer finds the target's spec and partition by its path.
 pub trait DeletePosition {
     fn data_file(&self) -> &str;
     fn row_position(&self) -> u64;
-    /// Whether the position is in the writer's unpartitioned spec `spec_id`.
-    fn in_spec(&self, spec_id: i32) -> bool;
 }
 
 impl DeletePosition for RowLocation {
@@ -189,9 +198,6 @@ impl DeletePosition for RowLocation {
     fn row_position(&self) -> u64 {
         self.row_position
     }
-    fn in_spec(&self, spec_id: i32) -> bool {
-        self.spec_id == spec_id && self.partition.is_empty()
-    }
 }
 
 impl DeletePosition for (&str, u64) {
@@ -200,9 +206,6 @@ impl DeletePosition for (&str, u64) {
     }
     fn row_position(&self) -> u64 {
         self.1
-    }
-    fn in_spec(&self, _: i32) -> bool {
-        true
     }
 }
 
@@ -278,13 +281,39 @@ pub enum SortMode {
 struct WriterSort {
     spec: SortSpec,
     mode: SortMode,
-    verifier: SortVerifier,
-    /// Whether every row of the current file so far was in order.
-    file_sorted: bool,
+}
+
+/// Open files a partitioned writer keeps at once. Opening another closes the
+/// least recently written one, so a write spanning more partitions writes
+/// more, smaller files instead of holding a file open for each.
+const MAX_OPEN_PARTITION_FILES: usize = 64;
+
+/// Row groups a partitioned writer buffers across its open files, in units
+/// of `row_group_bytes`. Past it the largest buffered row group is flushed.
+const PARTITION_BUFFER_ROW_GROUPS: usize = 4;
+
+/// Computes each row's partition under a partitioned spec.
+struct Partitioner {
+    calculator: PartitionValueCalculator,
+}
+
+/// One open output file and the partition all its rows belong to.
+struct OpenFile {
+    key: Vec<u8>,
+    partition: Struct,
+    writer: ParquetWriter,
+    row_group: RowGroupBudget,
+    verifier: Option<SortVerifier>,
+    /// Whether every row of this file so far was in order.
+    sorted: bool,
+    last_write: u64,
 }
 
 /// One file is rotated only between batches, so positions are known as rows are written.
 /// An operation ID is immutable: retries must reuse prepared artifacts, never overwrite them.
+///
+/// Under a partitioned spec (see [`Self::with_partition_spec`]) each output
+/// file holds one partition, and a batch's rows go to their partitions' files.
 pub struct DataWriter {
     file_io: FileIO,
     schema: TableSchema,
@@ -295,10 +324,11 @@ pub struct DataWriter {
     config: WriterConfig,
     prefix: String,
     next_file: usize,
-    current: Option<ParquetWriter>,
-    row_group: RowGroupBudget,
+    open: Vec<OpenFile>,
     files: Vec<DataFile>,
     spec_id: i32,
+    partitioner: Option<Partitioner>,
+    writes: u64,
     arrow_schema: arrow_schema::SchemaRef,
     lineage_schema: Option<arrow_schema::SchemaRef>,
 }
@@ -336,18 +366,41 @@ impl DataWriter {
             config,
             prefix: format!("{}/data/{}", location.trim_end_matches('/'), operation.0),
             next_file: 0,
-            current: None,
-            row_group: RowGroupBudget::default(),
+            open: Vec::new(),
             files: Vec::new(),
             spec_id,
+            partitioner: None,
+            writes: 0,
             lineage_schema: None,
         })
+    }
+
+    /// Write files in `spec`, whose ID replaces the one given to [`Self::new`].
+    /// A partitioned spec splits rows by their transformed values; its source
+    /// fields must be columns of the writer's schema.
+    pub fn with_partition_spec(mut self, spec: &PartitionSpec) -> Result<Self> {
+        ensure!(
+            self.open.is_empty() && self.files.is_empty(),
+            "partition spec must be configured before writing"
+        );
+        ensure!(spec.spec_id() >= 0, "invalid spec ID");
+        self.spec_id = spec.spec_id();
+        self.partitioner = if spec.is_unpartitioned() {
+            None
+        } else {
+            let schema = iceberg_schema(&self.schema)?;
+            Some(Partitioner {
+                calculator: PartitionValueCalculator::try_new(spec, &schema)
+                    .context("partition spec does not apply to the table schema")?,
+            })
+        };
+        Ok(self)
     }
 
     /// Preserve reserved Iceberg row lineage while rewriting existing rows.
     pub fn with_row_lineage(mut self) -> Result<Self> {
         ensure!(
-            self.current.is_none() && self.files.is_empty(),
+            self.open.is_empty() && self.files.is_empty(),
             "lineage must be configured before writing"
         );
         let schema = crate::lineage::writer_schema(&self.schema)?;
@@ -362,7 +415,7 @@ impl DataWriter {
     /// [`SortMode::Sorted`], a row out of order is an error.
     pub fn with_sort(mut self, spec: &SortSpec, mode: SortMode) -> Result<Self> {
         ensure!(
-            self.current.is_none() && self.files.is_empty(),
+            self.open.is_empty() && self.files.is_empty(),
             "sort order must be configured before writing"
         );
         ensure!(
@@ -375,8 +428,6 @@ impl DataWriter {
         self.sort = Some(WriterSort {
             spec: spec.clone(),
             mode,
-            verifier: SortVerifier::new(spec),
-            file_sorted: true,
         });
         self.rebuild()?;
         Ok(self)
@@ -440,7 +491,7 @@ impl DataWriter {
             let offset = locations.len();
             // Rows were validated when the write call was admitted.
             let fingerprints: Vec<_> = rows.iter().map(|row| fingerprint(row.borrow())).collect();
-            self.write_batch(
+            self.write_partitioned(
                 validated_columns(&self.schema, rows, true)?,
                 count,
                 lineage.map(|values| &values[offset..offset + count]),
@@ -507,7 +558,7 @@ impl DataWriter {
         let mut offset = 0;
         while offset < rows {
             let (count, bytes) = bounded_batch(&sizes[offset..], &self.config, |bytes| Ok(*bytes))?;
-            self.write_batch(
+            self.write_partitioned(
                 batch.slice(offset, count).columns().to_vec(),
                 count,
                 lineage.map(|values| &values[offset..offset + count]),
@@ -522,9 +573,202 @@ impl DataWriter {
         Ok(WrittenBatch { locations })
     }
 
+    /// Route a bounded batch to its partitions' files. Locations are appended
+    /// in the batch's row order.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_partitioned(
+        &mut self,
+        columns: Vec<ArrayRef>,
+        rows: usize,
+        lineage: Option<&[crate::RowLineage]>,
+        fingerprints: &[[u8; 16]],
+        bytes: usize,
+        source_lsn: PgLsn,
+        locations: &mut Vec<RowLocation>,
+    ) -> Result<()> {
+        let Some(partitioner) = &self.partitioner else {
+            return self
+                .write_batch(
+                    Vec::new(),
+                    Struct::empty(),
+                    columns,
+                    rows,
+                    lineage,
+                    fingerprints,
+                    bytes,
+                    source_lsn,
+                    locations,
+                )
+                .await;
+        };
+        let values = partitioner
+            .calculator
+            .calculate(&RecordBatch::try_new(
+                self.arrow_schema.clone(),
+                columns.clone(),
+            )?)
+            .context("compute partition values")?;
+        let tuples = arrow_struct_to_literal(&values, partitioner.calculator.partition_type())
+            .context("read partition values")?;
+        // Group rows by partition, keeping each group's rows in batch order.
+        // Neighbouring rows usually share a partition; check the last first.
+        let mut groups: Vec<(Vec<u8>, Struct, Vec<u32>)> = Vec::new();
+        let mut index = std::collections::HashMap::<Vec<u8>, usize>::new();
+        let mut last: Option<usize> = None;
+        for (row, tuple) in tuples.into_iter().enumerate() {
+            let partition = match tuple {
+                Some(Literal::Struct(partition)) => partition,
+                _ => anyhow::bail!("partition values are not a struct"),
+            };
+            let key = flow_iceberg_ext::partition_key(&partition);
+            let group = match last.filter(|&group| groups[group].0 == key) {
+                Some(group) => group,
+                None => *index.entry(key.clone()).or_insert_with(|| {
+                    groups.push((key, partition, Vec::new()));
+                    groups.len() - 1
+                }),
+            };
+            last = Some(group);
+            groups[group].2.push(row as u32);
+        }
+        if let [(key, partition, _)] = groups.as_mut_slice() {
+            let (key, partition) = (
+                std::mem::take(key),
+                std::mem::replace(partition, Struct::empty()),
+            );
+            return self
+                .write_batch(
+                    key,
+                    partition,
+                    columns,
+                    rows,
+                    lineage,
+                    fingerprints,
+                    bytes,
+                    source_lsn,
+                    locations,
+                )
+                .await;
+        }
+        let mut placed: Vec<Option<RowLocation>> = vec![None; rows];
+        for (key, partition, indices) in groups {
+            let take = UInt32Array::from(indices);
+            let columns = columns
+                .iter()
+                .map(|column| arrow_select::take::take(column.as_ref(), &take, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            let group_lineage: Option<Vec<_>> = lineage.map(|values| {
+                take.values()
+                    .iter()
+                    .map(|&row| values[row as usize])
+                    .collect()
+            });
+            let group_fingerprints: Vec<_> = take
+                .values()
+                .iter()
+                .map(|&row| fingerprints[row as usize])
+                .collect();
+            let group_bytes = bytes.saturating_mul(take.len()).div_ceil(rows.max(1));
+            let mut written = Vec::with_capacity(take.len());
+            self.write_batch(
+                key,
+                partition,
+                columns,
+                take.len(),
+                group_lineage.as_deref(),
+                &group_fingerprints,
+                group_bytes,
+                source_lsn,
+                &mut written,
+            )
+            .await?;
+            for (&row, location) in take.values().iter().zip(written) {
+                placed[row as usize] = Some(location);
+            }
+        }
+        for location in placed {
+            locations.push(location.context("partitioned write lost a row")?);
+        }
+        Ok(())
+    }
+
+    /// The index of the open file for `key`, opening one if needed.
+    async fn open_file(&mut self, key: Vec<u8>, partition: Struct) -> Result<usize> {
+        let existing = self.open.iter().position(|file| file.key == key);
+        if let Some(index) = existing {
+            if self.open[index].writer.current_written_size() < self.config.target_file_bytes {
+                return Ok(index);
+            }
+            self.finish_file(index).await?;
+        }
+        if self.open.len() >= MAX_OPEN_PARTITION_FILES {
+            let oldest = self
+                .open
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, file)| file.last_write)
+                .map(|(index, _)| index)
+                .expect("open files at the limit");
+            self.finish_file(oldest).await?;
+        }
+        let path = format!("{}-data-{:06}.parquet", self.prefix, self.next_file);
+        self.next_file += 1;
+        if let Some(tracker) = &self.config.artifact_tracker {
+            tracker
+                .register(ArtifactSet {
+                    paths: vec![path.clone()],
+                    ranges: Vec::new(),
+                })
+                .await?;
+        }
+        let writer = self
+            .builder
+            .build(self.file_io.new_output(path)?.if_absent())
+            .await?;
+        self.open.push(OpenFile {
+            key,
+            partition,
+            writer,
+            row_group: RowGroupBudget::default(),
+            verifier: self.sort.as_ref().map(|sort| SortVerifier::new(&sort.spec)),
+            sorted: true,
+            last_write: 0,
+        });
+        Ok(self.open.len() - 1)
+    }
+
+    /// Flush buffered row groups, largest first, until the open files hold
+    /// at most [`PARTITION_BUFFER_ROW_GROUPS`] row groups' bytes. A write to
+    /// a few partitions keeps the usual row-group size.
+    async fn bound_buffers(&mut self) -> Result<()> {
+        if self.open.len() < 2 {
+            return Ok(());
+        }
+        let budget = self
+            .config
+            .row_group_bytes
+            .saturating_mul(PARTITION_BUFFER_ROW_GROUPS);
+        let mut total: usize = self.open.iter().map(|file| file.row_group.bytes).sum();
+        while total > budget {
+            let (index, _) = self
+                .open
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, file)| file.row_group.bytes)
+                .expect("open files");
+            let file = &mut self.open[index];
+            total -= file.row_group.bytes;
+            file.writer.flush_row_group().await?;
+            file.row_group = RowGroupBudget::default();
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn write_batch(
         &mut self,
+        key: Vec<u8>,
+        partition: Struct,
         mut columns: Vec<ArrayRef>,
         rows: usize,
         lineage: Option<&[crate::RowLineage]>,
@@ -533,48 +777,24 @@ impl DataWriter {
         source_lsn: PgLsn,
         locations: &mut Vec<RowLocation>,
     ) -> Result<()> {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|w| w.current_written_size() >= self.config.target_file_bytes)
-        {
-            self.finish_file().await?;
-        }
-        if self.current.is_none() {
-            let path = format!("{}-data-{:06}.parquet", self.prefix, self.next_file);
-            self.next_file += 1;
-            if let Some(tracker) = &self.config.artifact_tracker {
-                tracker
-                    .register(ArtifactSet {
-                        paths: vec![path.clone()],
-                        ranges: Vec::new(),
-                    })
-                    .await?;
-            }
-            self.current = Some(
-                self.builder
-                    .build(self.file_io.new_output(path)?.if_absent())
-                    .await?,
-            );
-            if let Some(sort) = &mut self.sort {
-                sort.verifier.reset();
-                sort.file_sorted = true;
-            }
-        }
-        if let Some(sort) = &mut self.sort
-            && sort.file_sorted
-            && !sort.verifier.accept(&columns)?
+        let index = self.open_file(key, partition).await?;
+        self.writes += 1;
+        let writes = self.writes;
+        let file = &mut self.open[index];
+        file.last_write = writes;
+        if let (Some(sort), Some(verifier)) = (&self.sort, &mut file.verifier)
+            && file.sorted
+            && !verifier.accept(&columns)?
         {
             ensure!(
                 sort.mode == SortMode::Verify,
                 "rows are out of the table's sort order {}",
                 sort.spec.order_id
             );
-            sort.file_sorted = false;
+            file.sorted = false;
         }
-        let writer = self.current.as_mut().expect("writer opened above");
-        self.row_group
-            .prepare(writer, rows, bytes, &self.config)
+        file.row_group
+            .prepare(&mut file.writer, rows, bytes, &self.config)
             .await?;
         let batch = if let Some(schema) = &self.lineage_schema {
             for row_id in [true, false] {
@@ -593,10 +813,10 @@ impl DataWriter {
         } else {
             RecordBatch::try_new(self.arrow_schema.clone(), columns)?
         };
-        let path = writer.current_file_path();
-        let offset = writer.current_row_num() as u64;
-        writer.write(&batch).await?;
-        self.row_group.written(rows, bytes, &self.config);
+        let path = file.writer.current_file_path();
+        let offset = file.writer.current_row_num() as u64;
+        file.writer.write(&batch).await?;
+        file.row_group.written(rows, bytes, &self.config);
         for (i, fingerprint) in fingerprints.iter().enumerate() {
             locations.push(RowLocation {
                 data_file_id: FileId(path.clone()),
@@ -609,29 +829,40 @@ impl DataWriter {
                 row_fingerprint: *fingerprint,
             });
         }
-        Ok(())
-    }
-    async fn finish_file(&mut self) -> Result<()> {
-        if let Some(writer) = self.current.take() {
-            let order = match &self.sort {
-                Some(sort) if sort.file_sorted => Some(sort.spec.iceberg_order_id()?),
-                _ => None,
-            };
-            for mut file in writer.close().await? {
-                file.content(DataContentType::Data)
-                    .partition(Struct::empty())
-                    .partition_spec_id(self.spec_id);
-                if let Some(order) = order {
-                    file.sort_order_id(order);
-                }
-                self.files.push(file.build()?);
-            }
+        if self.partitioner.is_some() {
+            self.bound_buffers().await?;
         }
-        self.row_group = RowGroupBudget::default();
         Ok(())
     }
+
+    async fn finish_file(&mut self, index: usize) -> Result<()> {
+        let file = self.open.remove(index);
+        let order = match &self.sort {
+            Some(sort) if file.sorted => Some(sort.spec.iceberg_order_id()?),
+            _ => None,
+        };
+        for mut built in file.writer.close().await? {
+            built
+                .content(DataContentType::Data)
+                .partition(file.partition.clone())
+                .partition_spec_id(self.spec_id);
+            if let Some(order) = order {
+                built.sort_order_id(order);
+            }
+            self.files.push(built.build()?);
+        }
+        Ok(())
+    }
+
     pub async fn close(mut self) -> Result<Vec<DataFile>> {
-        self.finish_file().await?;
+        // Close in file order so the returned files follow their names.
+        self.open
+            .sort_by_key(|file| file.writer.current_file_path());
+        while !self.open.is_empty() {
+            self.finish_file(0).await?;
+        }
+        self.files
+            .sort_by(|left, right| left.file_path().cmp(right.file_path()));
         Ok(self.files)
     }
 }
@@ -645,13 +876,15 @@ pub(crate) struct ParquetDeleteWriter {
     arrow_schema: arrow_schema::SchemaRef,
     config: WriterConfig,
     prefix: String,
-    next_file: usize,
+    /// Names the next file; shared by the writers of one operation.
+    next_file: Arc<AtomicUsize>,
     current: Option<ParquetWriter>,
     row_group: RowGroupBudget,
     files: Vec<DataFile>,
     last: Option<(String, u64)>,
     file_paths: Option<(String, String)>,
-    spec_id: i32,
+    /// Spec and partition of every file; all its targets share them.
+    partition: (i32, Struct),
     /// Files closing concurrently; see [`Self::finish_file_concurrently`].
     closing: FuturesUnordered<BoxFuture<'static, Result<Vec<DataFile>>>>,
     closed_concurrently: bool,
@@ -661,11 +894,12 @@ pub(crate) struct ParquetDeleteWriter {
 const MAX_CONCURRENT_CLOSES: usize = 8;
 
 impl ParquetDeleteWriter {
-    pub fn new(
+    fn new(
         file_io: FileIO,
         location: &str,
         operation: &OperationId,
-        spec_id: i32,
+        partition: (i32, Struct),
+        next_file: Arc<AtomicUsize>,
         config: WriterConfig,
     ) -> Result<Self> {
         let schema = Arc::new(
@@ -700,13 +934,13 @@ impl ParquetDeleteWriter {
             arrow_schema,
             config,
             prefix: format!("{}/data/{}", location.trim_end_matches('/'), operation.0),
-            next_file: 0,
+            next_file,
             current: None,
             row_group: RowGroupBudget::default(),
             files: vec![],
             last: None,
             file_paths: None,
-            spec_id,
+            partition,
             closing: FuturesUnordered::new(),
             closed_concurrently: false,
         })
@@ -720,10 +954,6 @@ impl ParquetDeleteWriter {
             .as_ref()
             .map(|(path, position)| (path.as_str(), *position));
         for p in positions {
-            ensure!(
-                p.in_spec(self.spec_id),
-                "position deletes require matching unpartitioned spec"
-            );
             ensure!(
                 p.row_position() <= i64::MAX as u64,
                 "position overflows Iceberg long"
@@ -757,8 +987,11 @@ impl ParquetDeleteWriter {
             self.finish_file().await?;
         }
         if self.current.is_none() {
-            let path = format!("{}-delete-{:06}.parquet", self.prefix, self.next_file);
-            self.next_file += 1;
+            let path = format!(
+                "{}-delete-{:06}.parquet",
+                self.prefix,
+                self.next_file.fetch_add(1, AtomicOrdering::Relaxed)
+            );
             if let Some(tracker) = &self.config.artifact_tracker {
                 tracker
                     .register(ArtifactSet {
@@ -838,12 +1071,12 @@ impl ParquetDeleteWriter {
             return Ok(None);
         };
         let (first, last) = self.file_paths.take().context("delete file has no rows")?;
-        let spec_id = self.spec_id;
+        let (spec_id, partition) = self.partition.clone();
         Ok(Some(Box::pin(async move {
             let mut files = Vec::new();
             for mut file in writer.close().await? {
                 file.content(DataContentType::PositionDeletes)
-                    .partition(Struct::empty())
+                    .partition(partition.clone())
                     .partition_spec_id(spec_id);
                 // Parquet's string statistics can be omitted or truncated. These
                 // exact bounds let readers exclude unrelated delete-file ranges.
@@ -870,5 +1103,177 @@ impl ParquetDeleteWriter {
                 .sort_by(|left, right| left.file_path().cmp(right.file_path()));
         }
         Ok(self.files)
+    }
+}
+
+/// Whether positions on a target may join the delete file holding the
+/// positions of an earlier one, both in one partition; see
+/// [`crate::DeleteWriter::with_sharing`].
+pub type SharingRule = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Delete files a pooled writer keeps open at once, one per partition.
+/// Opening another closes the least recently written one.
+const MAX_OPEN_DELETE_PARTITIONS: usize = 256;
+
+/// Position deletes in their targets' specs and partitions: one open file
+/// per partition, so the sorted positions of an epoch that touches many
+/// partitions still pool into one file in each. Input must be sorted by path
+/// and position, as for [`ParquetDeleteWriter`].
+pub(crate) struct PooledDeleteWriter {
+    file_io: FileIO,
+    location: String,
+    operation: OperationId,
+    config: WriterConfig,
+    targets: TargetPartitions,
+    sharing: Option<SharingRule>,
+    next_file: Arc<AtomicUsize>,
+    writers: Vec<ParquetDeleteWriter>,
+    by_partition: HashMap<(i32, Vec<u8>), usize>,
+    last_write: Vec<u64>,
+    writes: u64,
+    last: Option<usize>,
+}
+
+impl PooledDeleteWriter {
+    pub(crate) fn new(
+        file_io: FileIO,
+        location: &str,
+        operation: &OperationId,
+        targets: TargetPartitions,
+        config: WriterConfig,
+    ) -> Result<Self> {
+        ensure!(
+            !operation.0.is_empty()
+                && operation
+                    .0
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid operation ID"
+        );
+        Ok(Self {
+            file_io,
+            location: location.to_owned(),
+            operation: operation.clone(),
+            config,
+            targets,
+            sharing: None,
+            next_file: Arc::new(AtomicUsize::new(0)),
+            writers: Vec::new(),
+            by_partition: HashMap::new(),
+            last_write: Vec::new(),
+            writes: 0,
+            last: None,
+        })
+    }
+
+    pub(crate) fn set_sharing(&mut self, rule: SharingRule) {
+        self.sharing = Some(rule);
+    }
+
+    fn writer(&mut self, path: &str) -> Result<usize> {
+        let (spec_id, partition) = self.targets.get(path)?;
+        let key = if self.targets.is_uniform() {
+            (spec_id, Vec::new())
+        } else {
+            (spec_id, flow_iceberg_ext::partition_key(partition))
+        };
+        if let Some(&index) = self.by_partition.get(&key) {
+            return Ok(index);
+        }
+        let partition = (spec_id, partition.clone());
+        self.writers.push(ParquetDeleteWriter::new(
+            self.file_io.clone(),
+            &self.location,
+            &self.operation,
+            partition,
+            self.next_file.clone(),
+            self.config.clone(),
+        )?);
+        self.last_write.push(0);
+        self.by_partition.insert(key, self.writers.len() - 1);
+        Ok(self.writers.len() - 1)
+    }
+
+    pub(crate) async fn write(&mut self, positions: &[impl DeletePosition]) -> Result<()> {
+        // Admit the whole call before any partition opens a file, so an
+        // oversized late position leaves no partial artifact behind.
+        for position in positions {
+            ensure!(
+                position.row_position() <= i64::MAX as u64,
+                "position overflows Iceberg long"
+            );
+            self.config.admit_row(delete_bytes(position)?)?;
+            self.targets.get(position.data_file())?;
+        }
+        let mut start = 0;
+        while start < positions.len() {
+            let path = positions[start].data_file();
+            let mut end = start + 1;
+            while end < positions.len() && positions[end].data_file() == path {
+                end += 1;
+            }
+            let index = self.writer(path)?;
+            let writer = &mut self.writers[index];
+            if let (Some(rule), Some((previous, _))) = (&self.sharing, &writer.last)
+                && writer.current.is_some()
+                && previous != path
+                && !rule(previous, path)
+            {
+                writer.finish_file_concurrently().await?;
+            }
+            if self.writers[index].current.is_none() {
+                self.bound_open_files().await?;
+            }
+            self.writes += 1;
+            self.last_write[index] = self.writes;
+            self.writers[index].write(&positions[start..end]).await?;
+            self.last = Some(index);
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Close the least recently written file once too many are open.
+    async fn bound_open_files(&mut self) -> Result<()> {
+        let open = self
+            .writers
+            .iter()
+            .filter(|writer| writer.current.is_some())
+            .count();
+        if open < MAX_OPEN_DELETE_PARTITIONS {
+            return Ok(());
+        }
+        let oldest = (0..self.writers.len())
+            .filter(|&index| self.writers[index].current.is_some())
+            .min_by_key(|&index| self.last_write[index])
+            .expect("open delete files");
+        self.writers[oldest].finish_file_concurrently().await
+    }
+
+    /// Close every open file before admitting another sorted range.
+    pub(crate) async fn finish_file(&mut self) -> Result<()> {
+        for writer in &mut self.writers {
+            writer.finish_file().await?;
+        }
+        Ok(())
+    }
+
+    /// Close the file the last positions went to, letting its upload overlap
+    /// later writes.
+    pub(crate) async fn finish_file_concurrently(&mut self) -> Result<()> {
+        match self.last {
+            Some(index) => self.writers[index].finish_file_concurrently().await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn close(self) -> Result<Vec<DataFile>> {
+        let mut files = Vec::new();
+        for writer in self.writers {
+            files.extend(writer.close().await?);
+        }
+        // Artifact names follow write order across partitions.
+        files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+        Ok(files)
     }
 }

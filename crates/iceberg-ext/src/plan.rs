@@ -5,8 +5,30 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 
-use crate::action::manifest_writer;
+use std::collections::BTreeMap;
+
+use crate::action::{manifest_writer, manifest_writer_at};
 use crate::{CommitBase, invalid};
+
+/// The most `-d` delete manifests a plan of `table` can need: deletes may
+/// target files of any spec but the first.
+pub fn plan_delete_manifests(table: &Table) -> usize {
+    table
+        .metadata()
+        .partition_specs_iter()
+        .len()
+        .saturating_sub(1)
+}
+
+/// The number of partition specs `deletes` span; a plan writes one delete
+/// manifest per spec.
+pub fn delete_specs(deletes: &[DataFile]) -> usize {
+    deletes
+        .iter()
+        .map(DataFile::partition_spec_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
 
 /// Durable native-Iceberg descriptions of immutable prepared data artifacts.
 #[derive(Debug, Clone)]
@@ -18,27 +40,65 @@ pub struct ArtifactPlan {
 /// Write native manifests and their native manifest list, with the list written
 /// last as the completion marker. `path` must be a unique immutable operation
 /// location. Persist the operation's CommitBase separately before publication.
+///
+/// A manifest holds one spec's files. Data files, which one operation writes in
+/// one spec, go to `-m0.avro`; deletes of the lowest spec go to `-m1.avro`, and
+/// those of each further spec to `-d0.avro`, `-d1.avro` and so on. Returns the
+/// number of `-d` manifests, which [`plan_delete_manifests`] bounds in advance.
 pub async fn write_artifact_plan(
     table: &Table,
     path: &str,
     added_data: &[DataFile],
     added_deletes: &[DataFile],
-) -> Result<()> {
+) -> Result<usize> {
     CommitBase::new(table).validate(table)?;
     let root = path;
     let mut writers = Vec::new();
-    for (number, (files, content)) in [
-        (added_data, ManifestContentType::Data),
-        (added_deletes, ManifestContentType::Deletes),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if files.is_empty() {
-            continue;
+    if let Some(first) = added_data.first() {
+        let spec_id = first.partition_spec_id();
+        if added_data
+            .iter()
+            .any(|file| file.partition_spec_id() != spec_id)
+        {
+            return Err(invalid("prepared data files span partition specs"));
         }
         // Conditional creates refuse to replace any artifact of an earlier attempt.
-        let mut writer = manifest_writer(table, 0, root, number, content, true)?;
+        let mut writer =
+            manifest_writer(table, 0, root, 0, ManifestContentType::Data, spec_id, true)?;
+        for file in added_data {
+            writer.add_file(file.clone(), -1)?;
+        }
+        writers.push(writer);
+    }
+    let mut by_spec: BTreeMap<i32, Vec<&DataFile>> = BTreeMap::new();
+    for file in added_deletes {
+        by_spec
+            .entry(file.partition_spec_id())
+            .or_default()
+            .push(file);
+    }
+    let extra = by_spec.len().saturating_sub(1);
+    for (index, (spec_id, files)) in by_spec.into_iter().enumerate() {
+        let mut writer = if index == 0 {
+            manifest_writer(
+                table,
+                0,
+                root,
+                1,
+                ManifestContentType::Deletes,
+                spec_id,
+                true,
+            )?
+        } else {
+            manifest_writer_at(
+                table,
+                0,
+                format!("{root}-d{}.avro", index - 1),
+                ManifestContentType::Deletes,
+                spec_id,
+                true,
+            )?
+        };
         for file in files {
             writer.add_file(file.clone(), -1)?;
         }
@@ -64,7 +124,8 @@ pub async fn write_artifact_plan(
         ManifestListWriter::v2(output, 0, None, 0)
     };
     writer.add_manifests(manifests.into_iter())?;
-    writer.close().await
+    writer.close().await?;
+    Ok(extra)
 }
 
 pub async fn read_artifact_plan(file_io: &FileIO, path: &str) -> Result<ArtifactPlan> {

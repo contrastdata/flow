@@ -71,6 +71,14 @@ class ReaderRun(Run):
         self.reader_tables = ("orders", "accounts") + (("duplicates",) if self.args.keyless_duplicates else ())
         self.set_compaction_policy({"oldest_l0_soft_ms": 60000, "oldest_l0_hard_ms": 300000})
         text = self.config.read_text()
+        if self.args.partitioned:
+            # Ingest files stay unpartitioned; the initial copy and every
+            # rewrite, native or Spark's, write these specs.
+            for table, partition in (("orders", '["year(day)", "bucket(4, id)"]'),
+                                     ("accounts", '["bucket(2, id)"]')):
+                line = f'target_table = "{table}"\n'
+                assert line in text, f"{table} is not configured"
+                text = text.replace(line, f"{line}partition = {partition}\n", 1)
         if self.args.keyless_duplicates:
             text += f'''\n[[tables]]
 source_namespace = "{self.name}"
@@ -90,6 +98,8 @@ columns = [
         self.spark_container = None
         self.last_external = None
         self.report.update(native_compaction=self.args.native_compaction,
+                           partitioned=self.args.partitioned,
+                           sql_partition=self.args.sql_partition,
                            keyless_duplicates=self.args.keyless_duplicates,
                            format_version=self.args.format_version,
                            compaction_age_ms={"soft": 60000, "hard": 300000})
@@ -128,6 +138,14 @@ columns = [
         metadata = metadata or self.table(table)
         return self.duck.execute(f"SELECT * FROM iceberg_scan(?) ORDER BY {order_by(table)}",
                                  [metadata["metadata-location"]]).fetchall()
+
+    def container_limits(self):
+        # Some VMs (including Conductor cloud workspaces) cannot apply cgroup
+        # limits; fixture.sh runs its services unbounded there too.
+        if self.args.unlimited_containers:
+            self.report["unlimited_containers"] = True
+            return []
+        return ["--cpus=2", "--memory=2g"]
 
     def prepare_readers(self):
         self.jars = self.args.jar_cache.resolve()
@@ -175,7 +193,7 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
 """)
         self.trino_container = self.name + "-trino"
         subprocess.run(["docker", "run", "-d", "--name", self.trino_container,
-                        "--network", self.args.network, "--cpus=2", "--memory=2g",
+                        "--network", self.args.network, *self.container_limits(),
                         "-v", f"{trino}:/etc/trino:ro", TRINO_IMAGE], check=True, text=True)
         deadline = time.monotonic() + self.args.timeout
         while time.monotonic() < deadline:
@@ -203,7 +221,7 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         fixtures = Path(__file__).resolve().parent / "reader_fixtures"
         self.spark_container = self.name + "-spark"
         command = ["docker", "run", "--rm", "--name", self.spark_container, "--network", self.args.network,
-                   "--cpus=2", "--memory=2g", "-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY",
+                   *self.container_limits(), "-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY",
                    "-e", "AWS_REGION", "-e", "TZ=UTC", "-e", "SPARK_LOCAL_IP=127.0.0.1", "-v", f"{fixtures}:/fixtures:ro",
                    "-v", f"{self.jars}:/iceberg:ro", "-v", f"{self.directory}:/artifacts:ro", SPARK_IMAGE,
                    "/opt/spark/bin/spark-submit", "--master", "local[2]", "--driver-memory", "1g",
@@ -308,6 +326,28 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         assert sum(file["record_count"] for file in deletes) > 0, "fresh cohort produced no live position deletes"
         return {"barrier": barrier, "snapshot": snapshot["snapshot-id"], "protected_delete_files": deletes}
 
+    def partition_from_sql(self):
+        # A spec set from SQL while the daemon runs applies from the next
+        # epoch: earlier files keep their spec, ingest stays unpartitioned
+        # and rewrites write the new spec.
+        before = self.table("orders")
+        reference = f"flow.{self.name}.orders"
+        self.spark_sql("sql-partition", [
+            {"name": "year", "sql": f"ALTER TABLE {reference} ADD PARTITION FIELD years(day)"},
+            {"name": "bucket", "sql": f"ALTER TABLE {reference} ADD PARTITION FIELD bucket(4, id)"},
+        ])
+        after = self.table("orders")["metadata"]
+        assert after["default-spec-id"] != before["metadata"]["default-spec-id"], "Spark did not change the spec"
+        barrier = self.transaction([
+            "UPDATE orders SET payload = 'after-sql-partition' WHERE id BETWEEN 300 AND 340",
+            "DELETE FROM orders WHERE id BETWEEN 341 AND 350",
+            "INSERT INTO orders (id, tenant, payload, day) VALUES (9100, 2, 'sql-partitioned', date '2001-02-03')",
+        ])
+        self.wait_materialized(barrier)
+        result = self.verify("after-sql-partition")
+        result["default_spec_id"] = after["default-spec-id"]
+        return result
+
     def restore_native(self):
         if self.args.native_compaction and getattr(self, "protect_rewrite_inputs", False):
             self.stop()
@@ -391,6 +431,8 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
             self.phase("snapshot-wal-handoff", self.handoff)
             self.phase("crud", self.mutations)
             self.phase("crud-independent-readers-and-history", lambda: self.verify("crud"))
+            if self.args.sql_partition:
+                self.phase("partition-spec-from-sql-while-running", self.partition_from_sql)
             if self.args.native_compaction:
                 initial = next(snapshot for snapshot in self.initial_metadata["metadata"]["snapshots"]
                                if snapshot["snapshot-id"] == self.initial_metadata["metadata"]["current-snapshot-id"])
@@ -466,6 +508,12 @@ def main():
                         help="create v3 targets; their deletes are deletion vectors")
     parser.add_argument("--v3-rewrite-manifests", action="store_true",
                         help="also run Spark rewrite_manifests on v3 targets (currently fails reconciliation)")
+    parser.add_argument("--unlimited-containers", action="store_true",
+                        help="run Spark and Trino without CPU and memory limits, for hosts that cannot apply them")
+    parser.add_argument("--sql-partition", action="store_true",
+                        help="partition orders from Spark while the daemon runs, then keep replicating")
+    parser.add_argument("--partitioned", action="store_true",
+                        help="partition orders by year(day), bucket(4, id) and accounts by bucket(2, id)")
     parser.add_argument("--keyless-duplicates", action="store_true",
                         help="include an append-only table with duplicate complete rows and retained history")
     args = parser.parse_args()

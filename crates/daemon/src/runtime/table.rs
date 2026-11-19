@@ -917,6 +917,14 @@ impl TableWork {
                     &schema,
                 )
                 .await?;
+                current = crate::schema::ensure_table_partition_spec(
+                    &self.store,
+                    self.catalog.as_ref(),
+                    &current,
+                    &self.config.tables[index],
+                    &schema,
+                )
+                .await?;
             }
             self.sort_checked
                 .lock()

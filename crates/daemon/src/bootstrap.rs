@@ -327,6 +327,10 @@ async fn prepare_source(
         let existing =
             crate::schema::ensure_table_sort_order(store, catalog, &existing, configured, &schema)
                 .await?;
+        let existing = crate::schema::ensure_table_partition_spec(
+            store, catalog, &existing, configured, &schema,
+        )
+        .await?;
         ensure!(
             existing.metadata().current_snapshot_id().is_none()
                 && *existing.metadata().current_schema().as_ref()

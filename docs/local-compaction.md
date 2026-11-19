@@ -298,7 +298,12 @@ depend on that rewrite retiring sparse vectors.
   `flow_events` target with `action`, `reason`, the path (`publication`,
   `idle`, `probe` or `build_active`) and the debt counts. Build and rewrite
   events carry the planner's `selection_reason` (`deleted_rows`,
-  `delete_file_count`, `small_files`, `l0_debt` or `promotion`) in both modes.
+  `delete_file_count`, `small_files`, `l0_debt`, `promotion`,
+  `target_deletes` or `partition_conversion`) in both modes.
+- A rewrite group shares one partition spec and partition. Its output is
+  written in the table's default spec, one file or more per partition, and
+  small-file debt is counted per partition. See
+  [partitioned tables](partitioning.md).
 
 ## Per-target delete layout
 

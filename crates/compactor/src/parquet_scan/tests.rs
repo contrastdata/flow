@@ -502,7 +502,7 @@ async fn missing_size_statistics_coalesce_before_index_lookups_with_physical_pos
         committed.table.file_io().clone(),
         committed.table.metadata().location(),
         &OperationId("deletes".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         flow_materializer::WriterConfig::default(),
     )?;
     let locations = deleted

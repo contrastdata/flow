@@ -9,6 +9,7 @@ mod action;
 mod artifacts;
 mod identity;
 mod manifests;
+mod partition;
 mod plan;
 mod snapshot;
 mod validation;
@@ -24,7 +25,13 @@ pub use artifacts::{
     commit_dependency, retained_artifacts,
 };
 pub use manifests::{ManifestRewritePolicy, RewriteManifestsAction};
-pub use plan::{ArtifactPlan, read_artifact_plan, write_artifact_plan};
+pub use partition::{
+    TargetPartitions, ingest_spec_id, partition_key, single_unpartitioned_spec,
+    unpartitioned_spec_update,
+};
+pub use plan::{
+    ArtifactPlan, delete_specs, plan_delete_manifests, read_artifact_plan, write_artifact_plan,
+};
 pub use snapshot::{ManifestCache, SnapshotView, exact_delete_target, position_delete_may_apply};
 pub use validation::{CommitBase, find_operation};
 

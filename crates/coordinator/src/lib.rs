@@ -15,6 +15,7 @@ mod artifacts;
 mod layout;
 mod ledger;
 mod maintenance;
+mod partitioning;
 mod publication;
 mod scheduler;
 mod schema;
@@ -29,6 +30,7 @@ pub use maintenance::{
     RunningCompaction, RunningCompactionPreparation, TableMaintenance, active_build_protection,
     discard_abandoned_builds,
 };
+pub use partitioning::ensure_ingest_spec;
 pub use publication::{
     CollapseLimits, CollapsedEpoch, Epoch, Prefold, ReplanRequired, TablePublisher, collapse_epoch,
     collapse_epoch_prefolded, resolve_catalog_operation,

@@ -133,7 +133,6 @@ impl TableMaintenance {
             }
             return Ok(stats);
         }
-        let spec_id = head.metadata().default_partition_spec_id();
         let read_limits = self.read_limits.clone();
         let worker_table = head.clone();
         let worker_schema = schema.clone();
@@ -283,13 +282,8 @@ impl TableMaintenance {
                     batch_rows,
                     &read_limits,
                     async |batch| {
-                        let deltas = index_rows(
-                            &worker_schema,
-                            &batch,
-                            &current,
-                            spec_id,
-                            materialized_lsn,
-                        )?;
+                        let deltas =
+                            index_rows(&worker_schema, &batch, &current, materialized_lsn)?;
                         added_rows += deltas.len() as u64;
                         index.stage_deltas(&insertion, deltas)?;
                         Ok(())

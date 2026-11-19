@@ -138,8 +138,12 @@ the committed manifests. Reusing those manifests and incrementally maintaining
 the validated view are future optimizations, contingent on profiling. No
 latency or throughput claim is inferred from local tests.
 
-The service supports unpartitioned v2 and v3 tables. It rejects v1 writes,
-partitioned or mixed-spec tables, encrypted writes, and equality-delete state.
+The service supports v2 and v3 tables, partitioned or not, including tables
+with files in several specs. Ingest epochs write an unpartitioned spec, rewrites
+the default spec, and each position delete or deletion vector its target's spec
+and partition; a prepared plan keeps one manifest per spec. See
+[partitioned tables](partitioning.md). It rejects v1 writes, encrypted writes,
+and equality-delete state.
 See [Iceberg v3](iceberg-v3.md) for deletion vectors, row lineage and upgrades.
 The integration tests use
 the real in-memory catalog and Avro readers/writers, including the stale-worker

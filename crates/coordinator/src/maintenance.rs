@@ -289,6 +289,48 @@ pub struct TableMaintenance {
     cache: ManifestCache,
     garbage: garbage::RetainedIndexes,
     demotions: MergeDemotions,
+    conversion: Arc<PartitionConversion>,
+}
+
+/// Tables that move files of an earlier partition spec into their current
+/// spec in the background, each within a byte budget refilled per hour.
+#[derive(Debug, Default)]
+struct PartitionConversion {
+    tables: BTreeSet<TableId>,
+    budgets: std::sync::Mutex<HashMap<TableId, (std::time::Instant, u64)>>,
+}
+
+impl PartitionConversion {
+    /// Bytes `table` may convert now, at most one rewrite's input.
+    fn available(&self, table: TableId, policy: &Policy) -> u64 {
+        if !self.tables.contains(&table) || policy.partition_convert_bytes_per_hour == 0 {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (at, bytes) = budgets
+            .entry(table)
+            .or_insert((now, policy.max_input_bytes));
+        let refill = (now.duration_since(*at).as_secs_f64()
+            * policy.partition_convert_bytes_per_hour as f64
+            / 3600.0) as u64;
+        *bytes = bytes.saturating_add(refill).min(policy.max_input_bytes);
+        *at = now;
+        *bytes
+    }
+
+    fn charge(&self, table: TableId, bytes: u64) {
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some((_, available)) = budgets.get_mut(&table) {
+            *available = available.saturating_sub(bytes);
+        }
+    }
 }
 
 impl TableMaintenance {
@@ -308,7 +350,44 @@ impl TableMaintenance {
             cache: ManifestCache::default(),
             garbage: garbage::RetainedIndexes::new(garbage::RETAINED_INDEX_BYTES),
             demotions: MergeDemotions::default(),
+            conversion: Arc::default(),
         })
+    }
+
+    /// Let `tables` rewrite files of an earlier partition spec into their
+    /// current spec in the background, within
+    /// `partition_convert_bytes_per_hour` each. Other tables convert a file
+    /// only when compaction rewrites it for another reason.
+    pub fn with_partition_conversion(mut self, tables: impl IntoIterator<Item = TableId>) -> Self {
+        self.conversion = Arc::new(PartitionConversion {
+            tables: tables.into_iter().collect(),
+            budgets: Default::default(),
+        });
+        self
+    }
+
+    /// `policy` for `table`, converting within its budget if it may.
+    fn conversion_policy<'a>(
+        &self,
+        table: &Table,
+        table_id: TableId,
+        mut policy: std::borrow::Cow<'a, Policy>,
+    ) -> std::borrow::Cow<'a, Policy> {
+        let available = self.conversion.available(table_id, &policy);
+        // A conversion group is never larger than its input budget; wait for
+        // a meaningful refill instead of rewriting small slices.
+        if available >= policy.l1_target_bytes.min(policy.max_input_bytes) {
+            let mut converting = policy.into_owned();
+            converting.convert_to_spec = Some(table.metadata().default_partition_spec_id());
+            policy = std::borrow::Cow::Owned(converting);
+        }
+        policy
+    }
+
+    fn charge_conversion(&self, table_id: TableId, plan: &flow_compactor::CompactionPlan) {
+        if plan.reason == flow_compactor::PlanReason::Conversion {
+            self.conversion.charge(table_id, plan.input_bytes);
+        }
     }
 
     /// Parsed manifests shared by every table's maintenance.
@@ -382,8 +461,8 @@ impl TableMaintenance {
                 delete_file_count: deletes.len(),
                 target_delete_files: 0,
                 age_ms,
-                spec_id: table.metadata().default_partition_spec_id(),
-                partition: Vec::new(),
+                spec_id: file.partition_spec_id(),
+                partition: flow_iceberg_ext::partition_key(file.partition()),
             });
         }
         let paths = files.iter().map(|file| file.id.clone()).collect::<Vec<_>>();
@@ -443,18 +522,25 @@ impl TableMaintenance {
             .policy
             .for_table(table.metadata().format_version(), &files);
         let per_target = policy.delete_layout == flow_compactor::DeleteLayout::PerTarget;
-        let legacy_delete_count = view
-            .live_files
-            .values()
-            .filter(|entry| {
-                entry.content_type() == DataContentType::PositionDeletes
-                    && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
-                    && !(per_target && view.single_target(entry).is_some())
-            })
-            .count();
-        // Legacy shared/dangling files add planning work across targets. A DV
-        // is scoped to one file; sparse vectors on healthy files are not global
-        // debt. Per-file density still schedules reclamation. With the
+        // A delete file applies only within its spec and partition, so each
+        // partition's count is its own debt, as for small files.
+        let mut legacy_by_partition = HashMap::<(i32, Vec<u8>), usize>::new();
+        for entry in view.live_files.values().filter(|entry| {
+            entry.content_type() == DataContentType::PositionDeletes
+                && entry.file_format() != iceberg::spec::DataFileFormat::Puffin
+                && !(per_target && view.single_target(entry).is_some())
+        }) {
+            *legacy_by_partition
+                .entry((
+                    entry.data_file.partition_spec_id(),
+                    flow_iceberg_ext::partition_key(entry.data_file.partition()),
+                ))
+                .or_default() += 1;
+        }
+        let legacy_delete_count = legacy_by_partition.values().copied().max().unwrap_or(0);
+        // Legacy shared/dangling files add planning work across the targets
+        // of their partition. A DV is scoped to one file; sparse vectors on
+        // healthy files are not global debt. Per-file density still schedules reclamation. With the
         // per-target layout, a file whose every position targets one live data
         // file is charged to that file's count alone, like a vector.
         let debt = policy.debt_with_shared_deletes(&files, legacy_delete_count)?;
@@ -498,18 +584,22 @@ impl TableMaintenance {
             return Ok(None);
         };
         let inventory = self.inventory(&table, table_id).await?;
-        let Some(mut plan) = self
-            .policy
-            .for_table(table.metadata().format_version(), &inventory.files)
-            .plan(
-                snapshot,
-                table.metadata().current_schema_id(),
-                &inventory.files,
-                &inventory.deletes,
-            )?
+        let policy = self.conversion_policy(
+            &table,
+            table_id,
+            self.policy
+                .for_table(table.metadata().format_version(), &inventory.files),
+        );
+        let Some(mut plan) = policy.plan(
+            snapshot,
+            table.metadata().current_schema_id(),
+            &inventory.files,
+            &inventory.deletes,
+        )?
         else {
             return Ok(None);
         };
+        self.charge_conversion(table_id, &plan);
         self.demotions.apply(table_id, &mut plan);
         let base = CommitBase::new(&table);
         let level = match plan.output_level {
@@ -616,7 +706,12 @@ impl TableMaintenance {
             return Err(ReplanRequired.into());
         }
         let path = artifacts::prepared_plan_path(head, &output.operation_id);
-        write_artifact_plan(head, &path, &output.data_files, &output.delete_files).await?;
+        context
+            .ownership
+            .reserve_plan_manifests(flow_iceberg_ext::delete_specs(&output.delete_files))
+            .await?;
+        let spec_manifests =
+            write_artifact_plan(head, &path, &output.data_files, &output.delete_files).await?;
         let level = match output.plan.output_level {
             Level::L0 => "L0",
             Level::L1 => "L1",
@@ -703,7 +798,7 @@ impl TableMaintenance {
             .sum::<u64>();
         let reservation = context
             .ownership
-            .finish(output.data_files.len(), output_delete_files)
+            .finish(output.data_files.len(), output_delete_files, spec_manifests)
             .await?;
         let fresh = ArtifactPlan {
             added_data: output.data_files.clone(),
@@ -1212,13 +1307,7 @@ impl TableMaintenance {
                         scan_scratch.batch_rows(),
                         &read_limits,
                         async |batch| {
-                            let deltas = index_rows(
-                                &scan_schema,
-                                &batch,
-                                &view,
-                                scan_table.metadata().default_partition_spec_id(),
-                                PgLsn(0),
-                            )?;
+                            let deltas = index_rows(&scan_schema, &batch, &view, PgLsn(0))?;
                             scan_scratch.stage_deltas(&scan_id, deltas)?;
                             Ok(())
                         },
@@ -1385,13 +1474,7 @@ impl TableMaintenance {
                 rebuilt.batch_rows(),
                 &read_limits,
                 async |batch| {
-                    let deltas = index_rows(
-                        &schema,
-                        &batch,
-                        &view,
-                        worker_table.metadata().default_partition_spec_id(),
-                        materialized_lsn,
-                    )?;
+                    let deltas = index_rows(&schema, &batch, &view, materialized_lsn)?;
                     rebuilt.stage_deltas(&worker_id, deltas)?;
                     Ok(())
                 },
@@ -1474,10 +1557,10 @@ fn index_rows(
     schema: &TableSchema,
     batch: &flow_compactor::LiveBatch,
     view: &SnapshotView,
-    spec_id: i32,
     last_lsn: PgLsn,
 ) -> Result<Vec<IndexDelta>> {
     let entry = &view.live_files[&batch.file_id.0];
+    let spec_id = entry.data_file.partition_spec_id();
     batch
         .rows
         .iter()

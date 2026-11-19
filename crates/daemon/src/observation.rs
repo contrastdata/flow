@@ -498,6 +498,19 @@ pub(crate) fn table_inventory(table: TableId, inventory: &Inventory) {
                 .as_ref()
                 .map_or(0.0, |overlap| overlap.mean_files),
         ),
+        (
+            "flow_table_partition_spec_id",
+            inventory.sort.partition_spec_id as f64,
+        ),
+        ("flow_table_partitions", inventory.sort.partitions as f64),
+        (
+            "flow_table_partition_max_files",
+            inventory.sort.partition_max_files as f64,
+        ),
+        (
+            "flow_table_off_spec_bytes",
+            inventory.sort.off_spec_bytes as f64,
+        ),
     ] {
         metrics::gauge!(name, "table_id" => table.clone()).set(value);
     }

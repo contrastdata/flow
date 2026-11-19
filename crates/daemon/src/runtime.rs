@@ -247,7 +247,17 @@ async fn run_service(
             crate::services::compacted_writer_config(&config),
         )?
         .with_read_limits(config.parquet_read.clone())?
-        .with_manifest_cache(publisher.manifest_cache().clone()),
+        .with_manifest_cache(publisher.manifest_cache().clone())
+        .with_partition_conversion(
+            config
+                .tables
+                .iter()
+                .zip(&boot.schemas)
+                .filter(|(table, _)| {
+                    table.partition_convert == crate::config::PartitionConvert::Background
+                })
+                .map(|(_, schema)| schema.table_id),
+        ),
     );
     for operation in store.pending_operations()? {
         ensure!(

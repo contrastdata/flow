@@ -5,7 +5,7 @@ use flow_model::FileId;
 use iceberg::spec::FormatVersion;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -84,6 +84,9 @@ pub enum PlanReason {
     /// reach `small_file_target_deletes` table-wide with
     /// [`DeleteLayout::PerTarget`].
     TargetDeletes,
+    /// Files outside L0 in a spec other than [`Policy::convert_to_spec`],
+    /// moved into it by background partition conversion.
+    Conversion,
 }
 
 impl PlanReason {
@@ -95,6 +98,7 @@ impl PlanReason {
             Self::L0Debt => "l0_debt",
             Self::Promotion => "promotion",
             Self::TargetDeletes => "target_deletes",
+            Self::Conversion => "partition_conversion",
         }
     }
 }
@@ -159,6 +163,10 @@ pub struct TargetDeletes {
 /// full-size file is charged for it, unless there are more than
 /// [`TargetRanges::MAX_BREAKS`] full-size files; then ranges may span them,
 /// as shared files do.
+///
+/// A delete applies only within its spec and partition, so a range holds one
+/// partition's targets and only that partition's full-size files end it. A
+/// file without a recorded partition may share a range with any.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetRanges {
     /// Live L0 and small data files.
@@ -168,6 +176,8 @@ pub struct TargetRanges {
     /// Data files at least this large are full-size:
     /// `target_delete_min_file_bytes`.
     pub full_size_bytes: u64,
+    /// Each data file's spec and partition key, where known.
+    pub partitions: BTreeMap<FileId, (i32, Vec<u8>)>,
 }
 
 impl TargetRanges {
@@ -184,18 +194,33 @@ impl TargetRanges {
         }
     }
 
+    /// Classify a data file a rewrite adds in a spec and partition.
+    pub fn add_in(&mut self, id: FileId, bytes: u64, spec_id: i32, partition: Vec<u8>) {
+        self.partitions.insert(id.clone(), (spec_id, partition));
+        self.add(id, bytes);
+    }
+
+    /// Whether two files may be in one partition: both recorded and equal,
+    /// or either unrecorded.
+    fn may_share(&self, left: &FileId, right: &FileId) -> bool {
+        match (self.partitions.get(left), self.partitions.get(right)) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+
     /// Whether positions on `next` may join the range that holds `previous`.
     pub fn continues(&self, previous: &FileId, next: &FileId) -> bool {
         use std::ops::Bound::Excluded;
         self.pooled.contains(previous)
             && self.pooled.contains(next)
             && previous < next
+            && self.may_share(previous, next)
             && (self.breaks.len() > Self::MAX_BREAKS
-                || self
+                || !self
                     .breaks
                     .range((Excluded(previous), Excluded(next)))
-                    .next()
-                    .is_none())
+                    .any(|full| self.may_share(previous, full)))
     }
 }
 
@@ -282,6 +307,15 @@ pub struct Policy {
     pub merge_memory_bytes: u64,
     /// Index entries one periodic visit may rewrite while materializing.
     pub remap_cleanup_rows: u64,
+    /// Bytes per hour one table with `partition_convert = "background"` may
+    /// rewrite to move files of an earlier partition spec into its current
+    /// spec. Other tables convert only files rewritten for other reasons.
+    pub partition_convert_bytes_per_hour: u64,
+    /// Set per table while it may convert in the background, never from
+    /// configuration: its default spec. Files outside L0 in any other spec
+    /// are then eligible, after every other kind of rewrite.
+    #[serde(skip)]
+    pub convert_to_spec: Option<i32>,
 }
 /// Well below the state store's translation hop limit.
 const MAX_REMAP_DEPTH: u64 = 1024;
@@ -333,6 +367,8 @@ impl Default for Policy {
             sort_merge: true,
             merge_memory_bytes: 1 << 30,
             remap_cleanup_rows: 32_768,
+            partition_convert_bytes_per_hour: 4 << 30,
+            convert_to_spec: None,
         }
     }
 }
@@ -347,8 +383,10 @@ pub enum PublicationPressure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Debt {
     pub l0_files: usize,
-    /// Undersized files outside L0, including external rewrite output. Level
-    /// hints cannot exempt a fragmented table from file-count maintenance.
+    /// Undersized files outside L0, including external rewrite output, in
+    /// the spec and partition that has the most. Files merge only within a
+    /// partition, and a partition-pruned read sees only its own. Level hints
+    /// cannot exempt a fragmented table from file-count maintenance.
     pub small_files: usize,
     pub l0_bytes: u64,
     pub oldest_l0_ms: u64,
@@ -425,6 +463,24 @@ pub enum Error {
     DependencyBudget,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Small files outside L0 per spec and partition: those a rewrite can merge.
+/// An unpartitioned table has one entry.
+fn small_files_by_partition(
+    files: &[FileCandidate],
+    l1_target_bytes: u64,
+) -> HashMap<(i32, &[u8]), usize> {
+    let mut small = HashMap::new();
+    for file in files
+        .iter()
+        .filter(|file| file.level != Level::L0 && file.size_bytes < l1_target_bytes)
+    {
+        *small
+            .entry((file.spec_id, file.partition.as_slice()))
+            .or_default() += 1;
+    }
+    small
+}
 
 impl Policy {
     pub fn needs_delete_reclamation(&self, file: &FileCandidate) -> bool {
@@ -508,6 +564,8 @@ impl Policy {
         };
         let mut identities = BTreeSet::new();
         let mut dense_deletes = false;
+        let small = small_files_by_partition(files, self.l1_target_bytes);
+        debt.small_files = small.values().copied().max().unwrap_or(0);
         for file in files {
             if !identities.insert(&file.id) || file.deleted_rows > file.row_count {
                 return Err(Error::InvalidInventory(
@@ -518,9 +576,6 @@ impl Policy {
                 debt.l0_files += 1;
                 debt.l0_bytes = debt.l0_bytes.saturating_add(file.size_bytes);
                 debt.oldest_l0_ms = debt.oldest_l0_ms.max(file.age_ms);
-            }
-            if file.level != Level::L0 && file.size_bytes < self.l1_target_bytes {
-                debt.small_files += 1;
             }
             if self.delete_layout == DeleteLayout::PerTarget
                 && file.level != Level::L0
@@ -736,6 +791,9 @@ impl Policy {
             ..TargetRanges::default()
         };
         for file in files.iter().filter(|file| !selected.contains(&file.id)) {
+            ranges
+                .partitions
+                .insert(file.id.clone(), (file.spec_id, file.partition.clone()));
             if self.full_size_target(file) {
                 ranges.breaks.insert(file.id.clone());
             } else {
@@ -1038,10 +1096,19 @@ impl Policy {
             (count_driven && f.delete_file_count >= self.delete_files_soft)
                 || self.needs_delete_reclamation(f)
         };
+        // Small files merge only within their spec and partition, so each
+        // partition's count is its own debt.
+        let small = small_files_by_partition(files, self.l1_target_bytes);
+        let partition_small = |file: &FileCandidate| {
+            small
+                .get(&(file.spec_id, file.partition.as_slice()))
+                .copied()
+                .unwrap_or(0)
+        };
         let needs_small_file_rewrite = |file: &FileCandidate| {
-            debt.small_files >= self.stable_small_soft_files
-                && file.level != Level::L0
+            file.level != Level::L0
                 && file.size_bytes < self.l1_target_bytes
+                && partition_small(file) >= self.stable_small_soft_files
         };
         // With the per-target layout, a small file's single-target deletes are
         // cheaper to remove by rewriting its few rows than to keep in one more
@@ -1053,6 +1120,12 @@ impl Policy {
                 && file.level != Level::L0
                 && !self.full_size_target(file)
                 && file.target_delete_files > 0
+        };
+        // Background conversion moves stable files of an older spec into the
+        // table's spec. Ingest files reach it through L0 compaction anyway.
+        let needs_conversion = |file: &FileCandidate| {
+            self.convert_to_spec
+                .is_some_and(|spec| file.level != Level::L0 && file.spec_id != spec)
         };
         // Under delete pressure, retiring effective positions can remove more
         // residual files than another small L0 rewrite. Hard L0 limits retain
@@ -1085,6 +1158,7 @@ impl Policy {
                             needs_delete_rewrite(file)
                                 || needs_small_file_rewrite(file)
                                 || needs_target_rewrite(file)
+                                || needs_conversion(file)
                         }
                     }
             })
@@ -1094,6 +1168,14 @@ impl Policy {
                 .cmp(&(hard_l0_debt && a.level == Level::L0))
                 .then_with(|| needs_delete_rewrite(b).cmp(&needs_delete_rewrite(a)))
                 .then_with(|| needs_small_file_rewrite(b).cmp(&needs_small_file_rewrite(a)))
+                .then_with(|| {
+                    // The partition with the most small files sets the debt.
+                    if needs_small_file_rewrite(a) && needs_small_file_rewrite(b) {
+                        partition_small(b).cmp(&partition_small(a))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| needs_target_rewrite(b).cmp(&needs_target_rewrite(a)))
                 .then_with(|| {
                     if needs_target_rewrite(a) && needs_target_rewrite(b) {
@@ -1102,6 +1184,7 @@ impl Policy {
                         std::cmp::Ordering::Equal
                     }
                 })
+                .then_with(|| needs_conversion(b).cmp(&needs_conversion(a)))
                 .then_with(|| {
                     if prioritize_reclamation && needs_delete_rewrite(a) && needs_delete_rewrite(b)
                     {
@@ -1137,8 +1220,13 @@ impl Policy {
             // Any carrier may be rewritten alone: its delete files go away.
             let target_group =
                 !small_group && !needs_delete_rewrite(seed) && needs_target_rewrite(seed);
+            let conversion_group = !small_group
+                && !target_group
+                && !needs_delete_rewrite(seed)
+                && needs_conversion(seed);
             let forced = needs_delete_rewrite(seed)
                 || target_group
+                || conversion_group
                 || (seed.level == Level::L0 && debt.pressure != PublicationPressure::Healthy);
             let reason = if self.needs_delete_reclamation(seed) {
                 PlanReason::DeletedRows
@@ -1148,6 +1236,8 @@ impl Policy {
                 PlanReason::SmallFiles
             } else if target_group {
                 PlanReason::TargetDeletes
+            } else if conversion_group {
+                PlanReason::Conversion
             } else if forced {
                 PlanReason::L0Debt
             } else {
@@ -1162,19 +1252,24 @@ impl Policy {
                     || count >= self.min_group_files
                         && (seed.level != Level::L1 || bytes >= target_file_bytes || small_group)
             };
-            // Small-file and target-delete groups take only their own kind,
-            // across levels outside L0 and of mixed small sizes.
+            // Small-file, target-delete and conversion groups take only their
+            // own kind, across levels outside L0 and of mixed sizes.
             let member = |file: &FileCandidate| {
                 small_group && needs_small_file_rewrite(file)
                     || target_group && needs_target_rewrite(file)
+                    || conversion_group && needs_conversion(file)
             };
+            // Output is split by partition, so a group rewritten for its
+            // deletes or its spec may span partitions. Merging small files or
+            // promoting a level is useful only within one.
+            let spans_partitions = target_group || conversion_group || needs_delete_rewrite(seed);
             let companions = eligible.iter().copied().filter(|file| {
                 if file.id == seed.id
                     || dense_only && !self.needs_delete_reclamation(file)
-                    || (small_group || target_group) && !member(file)
+                    || (small_group || target_group || conversion_group) && !member(file)
                     || (file.level != seed.level && !member(file))
-                    || file.spec_id != seed.spec_id
-                    || file.partition != seed.partition
+                    || !spans_partitions
+                        && (file.spec_id != seed.spec_id || file.partition != seed.partition)
                 {
                     return false;
                 }
@@ -1183,6 +1278,7 @@ impl Policy {
                 let smallest = seed.size_bytes.min(file.size_bytes).max(1);
                 small_group
                     || target_group
+                    || conversion_group
                     || u128::from(seed.size_bytes.max(file.size_bytes)) <= u128::from(smallest) * 4
             });
             let mut delete_files = BTreeSet::new();

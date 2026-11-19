@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, Int64Array, StringArray};
-use flow_iceberg_ext::{ManifestCache, SnapshotView};
+use flow_iceberg_ext::{ManifestCache, SnapshotView, TargetPartitions};
 use flow_materializer::{
     DataWriter, DeleteWriter, SortMode, SortSpec, TableSort, WriterConfig, rows_from_batch,
 };
@@ -200,8 +200,17 @@ pub async fn compact(
         retain_shared_legacy_deletes(&mut output, &built.base)?;
         return Ok(output);
     }
-    (output.delete_files, output.residual_delete_rows) =
-        write_residuals(table, &schema, &output, &output.operation_id.0, config).await?;
+    let targets =
+        TargetPartitions::of_view(table.metadata(), &built.base).with_files(&output.data_files);
+    (output.delete_files, output.residual_delete_rows) = write_residuals(
+        table,
+        &schema,
+        &output,
+        &output.operation_id.0,
+        &targets,
+        config,
+    )
+    .await?;
     Ok(output)
 }
 
@@ -267,16 +276,11 @@ pub async fn build_data(
     );
     ensure!(
         plan.schema_id == table.metadata().current_schema_id()
-            && plan.spec_id == table.metadata().default_partition_spec_id(),
+            && table
+                .metadata()
+                .partition_spec_by_id(plan.spec_id)
+                .is_some(),
         "compaction schema/spec changed"
-    );
-    ensure!(
-        table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .is_empty(),
-        "only unpartitioned compaction is supported"
     );
     ensure!(!plan.input_files.is_empty(), "compaction requires inputs");
     check_cancelled(Some(cancelled))?;
@@ -417,14 +421,19 @@ pub async fn build_data(
         }
         merge_inputs = inputs;
     }
+    // Inputs share a spec and partition; output is in the table's default
+    // spec, split by its partitions. This is how ingest files, and files of
+    // an older spec, reach the table's layout.
+    let output_spec = table.metadata().default_partition_spec();
     let mut writer = DataWriter::new(
         table.file_io().clone(),
         table.metadata().location(),
         &operation_id,
         schema.clone(),
-        plan.spec_id,
+        output_spec.spec_id(),
         config,
-    )?;
+    )?
+    .with_partition_spec(output_spec)?;
     if table.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
         writer = writer.with_row_lineage()?;
     }
@@ -759,6 +768,7 @@ pub(crate) async fn write_residuals(
     schema: &TableSchema,
     output: &WorkerOutput,
     scan: &str,
+    targets: &TargetPartitions,
     config: WriterConfig,
 ) -> Result<(Vec<DataFile>, u64)> {
     let positions = ResidualMerge::new(vec![ResidualInput::new(
@@ -767,7 +777,7 @@ pub(crate) async fn write_residuals(
             .position_delete_cursor(scan, &schema.table_id),
         |file| !output.plan.input_files.contains(file),
     )]);
-    write_residual_positions(table, output, positions, config).await
+    write_residual_positions(table, output, positions, targets, config).await
 }
 
 /// Consume a sorted, unique union without restaging its already ordered inputs.
@@ -777,6 +787,7 @@ pub(crate) async fn write_residual_positions(
     table: &Table,
     output: &WorkerOutput,
     mut positions: ResidualMerge<'_>,
+    targets: &TargetPartitions,
     mut config: WriterConfig,
 ) -> Result<(Vec<DataFile>, u64)> {
     // A shared residual must not grow into one globally charged dependency.
@@ -796,7 +807,7 @@ pub(crate) async fn write_residual_positions(
         table.file_io().clone(),
         table.metadata().location(),
         &output.operation_id,
-        output.plan.spec_id,
+        targets.clone(),
         config,
         table.metadata().format_version(),
     )?;
@@ -808,9 +819,11 @@ pub(crate) async fn write_residual_positions(
         && table.metadata().format_version() < iceberg::spec::FormatVersion::V3;
     let mut ranges = output.plan.target_ranges.clone();
     for file in &output.data_files {
-        ranges.add(
+        ranges.add_in(
             FileId(file.file_path().to_owned()),
             file.file_size_in_bytes(),
+            file.partition_spec_id(),
+            flow_iceberg_ext::partition_key(file.partition()),
         );
     }
     let outputs = output
@@ -825,7 +838,12 @@ pub(crate) async fn write_residual_positions(
     let mut current_rows = 0u64;
     let mut residual_rows = 0u64;
     let mut residual_target = false;
-    let mut target = None::<FileId>;
+    if per_target {
+        let ranges = ranges.clone();
+        writer = writer.with_sharing(move |previous, next| {
+            ranges.continues(&FileId(previous.to_owned()), &FileId(next.to_owned()))
+        });
+    }
     loop {
         if filled == batch.len() {
             batch.push(crate::residual::empty_location());
@@ -844,17 +862,7 @@ pub(crate) async fn write_residual_positions(
         }
         residual_rows += u64::from(residual_target);
         if per_target {
-            if starts {
-                if let Some(previous) = &target
-                    && !ranges.continues(previous, &position.data_file_id)
-                {
-                    writer.write(&batch[..filled]).await?;
-                    batch.swap(0, filled);
-                    filled = 0;
-                    writer.finish_target().await?;
-                }
-                target = Some(batch[filled].data_file_id.clone());
-            }
+            // The writer starts a target's file wherever `ranges` ends one.
             filled += 1;
             if filled == batch_rows {
                 writer.write(&batch[..filled]).await?;

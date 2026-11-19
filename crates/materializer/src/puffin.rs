@@ -360,7 +360,7 @@ mod tests {
             io.clone(),
             location,
             &OperationId("vectors".into()),
-            0,
+            flow_iceberg_ext::TargetPartitions::uniform(0),
             WriterConfig::default(),
             FormatVersion::V3,
         )

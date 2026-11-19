@@ -312,7 +312,7 @@ async fn long_delete_paths_are_admitted_and_sorted_across_batches_and_files() ->
         io(),
         directory.path().to_str().unwrap(),
         &OperationId("deletes".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         config.clone(),
     )?;
     writer.write(&positions[..2]).await?;
@@ -370,7 +370,7 @@ async fn explicit_delete_rotation_preserves_order_and_exact_path_bounds() -> any
         io(),
         directory.path().to_str().unwrap(),
         &OperationId("ranges".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig {
             target_file_bytes: usize::MAX,
             ..WriterConfig::default()
@@ -521,7 +521,7 @@ async fn oversized_late_rows_fail_before_any_output_and_leave_writers_reusable()
         io(),
         directory.path().to_str().unwrap(),
         &OperationId("deletes".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         config,
     )?;
     let good_delete = location("s3://bucket/a.parquet".into(), 0);

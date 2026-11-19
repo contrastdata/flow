@@ -20,7 +20,7 @@ use flow_pg_source::{
 };
 use flow_state_store::StateStore;
 use iceberg::{
-    Catalog,
+    Catalog, TableCommit, TableRequirement, TableUpdate,
     table::Table,
     transaction::{AddColumn, ApplyTransactionAction, Transaction},
 };
@@ -888,6 +888,94 @@ pub(crate) async fn ensure_table_schema(
     Ok(updated)
 }
 
+/// Apply an explicitly configured `partition` to an existing target whose
+/// default spec differs. Without `partition`, the table's own spec is left
+/// alone, so it can be managed from SQL. The change is metadata only: files
+/// keep their spec, compaction rewrites into the new one, and an
+/// unpartitioned spec is kept for ingest files. A lost response is resolved
+/// by reloading the table.
+pub(crate) async fn ensure_table_partition_spec(
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    table: &Table,
+    configured: &ConfiguredTable,
+    schema: &TableSchema,
+) -> Result<Table> {
+    let Some(desired) = configured.partition_spec(table.metadata().current_schema())? else {
+        return Ok(table.clone());
+    };
+    let fields = |spec: &iceberg::spec::PartitionSpec| {
+        spec.fields()
+            .iter()
+            .map(|field| (field.source_id, field.transform))
+            .collect::<Vec<_>>()
+    };
+    let matches = |table: &Table| {
+        fields(table.metadata().default_partition_spec()) == fields(&desired)
+            && flow_iceberg_ext::ingest_spec_id(table.metadata()).is_some()
+    };
+    if matches(table) {
+        return Ok(table.clone());
+    }
+    let metadata = table.metadata();
+    let previous = metadata.default_partition_spec_id();
+    let mut updates = Vec::new();
+    if fields(metadata.default_partition_spec()) != fields(&desired) {
+        updates.push(TableUpdate::AddSpec {
+            spec: desired.clone().into_unbound(),
+        });
+        updates.push(TableUpdate::SetDefaultSpec { spec_id: -1 });
+    }
+    if flow_iceberg_ext::ingest_spec_id(metadata).is_none() && !desired.is_unpartitioned() {
+        updates.push(TableUpdate::AddSpec {
+            spec: flow_iceberg_ext::unpartitioned_spec_update(),
+        });
+    }
+    let commit = TableCommit::builder()
+        .ident(table.identifier().clone())
+        .requirements(vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: previous,
+            },
+            TableRequirement::LastAssignedPartitionIdMatch {
+                last_assigned_partition_id: metadata.last_partition_id(),
+            },
+        ])
+        .updates(updates)
+        .build();
+    flow_coordinator::register_catalog_metadata(store, table, schema.table_id).await?;
+    let updated = match catalog.update_table(commit).await {
+        Ok(table) => table,
+        Err(error) => {
+            let refreshed = refresh_table(catalog, table).await?;
+            if !matches(&refreshed) {
+                return Err(error.into());
+            }
+            refreshed
+        }
+    };
+    ensure!(
+        updated.metadata().uuid() == table.metadata().uuid(),
+        "Iceberg target UUID changed during partition spec update"
+    );
+    ensure!(
+        matches(&updated),
+        "catalog partition spec differs from the configured partition"
+    );
+    tracing::info!(
+        event = "table_partition_spec_set",
+        table_id = schema.table_id.0,
+        previous_spec_id = previous,
+        spec_id = updated.metadata().default_partition_spec_id(),
+        fields = desired.fields().len(),
+        "configured partition spec applied to the target"
+    );
+    Ok(updated)
+}
+
 /// Apply an explicitly configured `sort` to an existing target whose default
 /// order differs. Without `sort`, the table's own order is left alone, so it
 /// can be managed from SQL. A lost response is resolved by reloading the table.
@@ -1058,6 +1146,93 @@ mod target_identity_tests {
             .await
             .unwrap();
         assert_eq!(order(&unsorted), flow_materializer::TableSort::Unsorted);
+    }
+
+    /// Targets are created unpartitioned. An explicit `partition` replaces a
+    /// differing spec, keeping an unpartitioned spec for ingest files; an
+    /// absent one leaves the table's spec alone.
+    #[tokio::test]
+    async fn explicit_partition_specs_are_reconciled_and_keep_an_ingest_spec() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            temp.path().join("index"),
+            flow_state_store::StateStoreOptions::default(),
+        )
+        .unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "partition",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.into(), "memory://partition".into())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("replicated".into());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let mut configured = config.tables[0].clone();
+        let schema = configured.schema(1);
+        let table = catalog
+            .create_table(
+                &namespace,
+                crate::services::table_creation(&configured, &schema, "orders".into()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(table.metadata().default_partition_spec().is_unpartitioned());
+        let fields = |table: &Table| {
+            table
+                .metadata()
+                .default_partition_spec()
+                .fields()
+                .iter()
+                .map(|field| (field.source_id, field.transform))
+                .collect::<Vec<_>>()
+        };
+
+        // Absent: the table's own spec stands.
+        let unchanged = ensure_table_partition_spec(&store, &catalog, &table, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.metadata_location(), table.metadata_location());
+
+        configured.partition = Some(crate::config::PartitionSetting::Fields(vec![
+            "bucket(8, id)".into(),
+            "status".into(),
+        ]));
+        let partitioned =
+            ensure_table_partition_spec(&store, &catalog, &table, &configured, &schema)
+                .await
+                .unwrap();
+        assert_eq!(
+            fields(&partitioned),
+            [
+                (1, iceberg::spec::Transform::Bucket(8)),
+                (2, iceberg::spec::Transform::Identity)
+            ]
+        );
+        assert_eq!(
+            flow_iceberg_ext::ingest_spec_id(partitioned.metadata()),
+            Some(0),
+            "the original unpartitioned spec stays for ingest files"
+        );
+        // Already matching: no new metadata.
+        let again =
+            ensure_table_partition_spec(&store, &catalog, &partitioned, &configured, &schema)
+                .await
+                .unwrap();
+        assert_eq!(again.metadata_location(), partitioned.metadata_location());
+
+        configured.partition = Some(crate::config::PartitionSetting::Unpartitioned);
+        let unpartitioned =
+            ensure_table_partition_spec(&store, &catalog, &again, &configured, &schema)
+                .await
+                .unwrap();
+        assert!(fields(&unpartitioned).is_empty());
+        assert_eq!(unpartitioned.metadata().default_partition_spec_id(), 0);
     }
 
     #[test]

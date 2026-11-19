@@ -1600,6 +1600,7 @@ dependencies = [
  "arrow-array",
  "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "flow-iceberg-ext",
  "flow-model",

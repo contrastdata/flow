@@ -169,8 +169,11 @@ Supported today:
   changes. Mutable tables need a primary key and `REPLICA IDENTITY DEFAULT` or
   `FULL`; see [replica identity](docs/getting-started.md#replica-identity).
   Tables without a primary key replicate append-only.
-- Unpartitioned Iceberg v2 (position deletes) and v3 (deletion vectors) tables
-  through an Iceberg REST catalog on S3-compatible storage.
+- Iceberg v2 (position deletes) and v3 (deletion vectors) tables through an
+  Iceberg REST catalog on S3-compatible storage, unpartitioned or with a
+  declared partition spec: change epochs stay unpartitioned and compaction
+  rewrites them into the table's partitions. See
+  [partitioned tables](docs/partitioning.md).
 - The [type mappings](docs/postgres-types.md); JSON and JSONB replicate as
   normalized JSON text.
 - Automatic schema evolution for nullable column additions and compatible

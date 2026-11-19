@@ -29,7 +29,7 @@ async fn batches_and_requested_rotation_keep_one_readable_vector_per_target() ->
         io.clone(),
         directory.path().to_str().unwrap(),
         &OperationId("rotation".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig {
             row_group_rows: 3,
             row_group_bytes: 1024,
@@ -86,7 +86,7 @@ async fn exact_budget_admits_container_transition_and_rejects_next_high_key() ->
         io,
         directory.path().to_str().unwrap(),
         &OperationId("budget".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig {
             row_group_rows: 128,
             row_group_bytes: budget,
@@ -121,7 +121,7 @@ async fn prior_vectors_union_with_new_positions_once_per_target() -> anyhow::Res
         io.clone(),
         location,
         &OperationId("priors".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig::default(),
         FormatVersion::V3,
     )?;
@@ -153,7 +153,7 @@ async fn prior_vectors_union_with_new_positions_once_per_target() -> anyhow::Res
         io,
         location,
         &OperationId("legacy".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig::default(),
     )?;
     assert!(

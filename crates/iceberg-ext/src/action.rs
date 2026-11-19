@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
-    ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Summary,
+    ManifestEntryRef, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation,
+    Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{Catalog, Result, TableCommit, TableRequirement, TableUpdate};
@@ -607,7 +607,9 @@ pub(crate) fn validate_live_vectors<'a>(
         let input = data
             .get(target.as_str())
             .ok_or_else(|| invalid(format!("deletion vector target is not live: {target}")))?;
-        if input.partition() != file.partition() {
+        if input.partition_spec_id() != file.partition_spec_id()
+            || input.partition() != file.partition()
+        {
             return Err(invalid("deletion vector partition differs from target"));
         }
     }
@@ -636,7 +638,7 @@ fn validate_additions(
         for file in files {
             if file.content_type() != content
                 || file.file_format() != format
-                || !file.partition().fields().is_empty()
+                || !partition_matches_spec(table, file)
                 || file.record_count() == 0
                 || file.file_size_in_bytes() == 0
                 || (content == DataContentType::Data && file.first_row_id().is_some())
@@ -653,6 +655,20 @@ fn validate_additions(
                     file.file_path()
                 )));
             }
+        }
+    }
+    // A delete written for one target must share its spec and partition, or
+    // readers never apply it. Shared files are partitioned by their writers.
+    for file in deletes {
+        if let Some(target) = crate::exact_delete_target(file)
+            && let Some(data) = view.live_files.get(&target)
+            && (data.data_file.partition_spec_id() != file.partition_spec_id()
+                || data.data_file.partition() != file.partition())
+        {
+            return Err(invalid(format!(
+                "delete {} is not in its target's partition",
+                file.file_path()
+            )));
         }
     }
     if view
@@ -673,6 +689,19 @@ fn validate_additions(
             .chain(deletes),
     )
 }
+
+/// Whether the file's partition tuple has its spec's arity. Values were
+/// computed by the spec's transforms when the file was written.
+fn partition_matches_spec(table: &Table, file: &DataFile) -> bool {
+    table
+        .metadata()
+        .partition_spec_by_id(file.partition_spec_id())
+        .is_some_and(|spec| spec.fields().len() == file.partition().fields().len())
+}
+
+/// The files a new manifest adds and the entries it removes, of one content
+/// type and spec.
+type ManifestGroup<'a> = (Vec<&'a DataFile>, Vec<&'a ManifestEntryRef>);
 
 struct Publication<'a> {
     artifact_tracker: Option<&'a dyn ArtifactTracker>,
@@ -757,19 +786,38 @@ async fn publish_scoped(
         } else if has_existing {
             rewritten.push((manifest, entries));
         } else {
-            // Keep this snapshot's deletions in its new content manifest,
-            // avoiding a separate deletion-only manifest for each input.
-            // SnapshotView already requires one current, unpartitioned spec.
+            // Keep this snapshot's deletions in its new content manifest of
+            // the same spec, avoiding a deletion-only manifest per input.
             match manifest.content {
                 ManifestContentType::Data => removed_data.extend(live),
                 ManifestContentType::Deletes => removed_deletes.extend(live),
             }
         }
     }
+    // One new manifest per content type and spec: a manifest's partition
+    // tuples all belong to its one spec.
+    let mut groups: BTreeMap<(u8, i32), ManifestGroup<'_>> = BTreeMap::new();
+    for (content, files, removed) in [
+        (0, publication.added_data, &removed_data),
+        (1, publication.added_deletes, &removed_deletes),
+    ] {
+        for file in files {
+            groups
+                .entry((content, file.partition_spec_id()))
+                .or_default()
+                .0
+                .push(file);
+        }
+        for entry in removed.iter().copied() {
+            groups
+                .entry((content, entry.data_file.partition_spec_id()))
+                .or_default()
+                .1
+                .push(entry);
+        }
+    }
     if let Some(tracker) = publication.artifact_tracker {
-        let count = rewritten.len()
-            + usize::from(!publication.added_data.is_empty() || !removed_data.is_empty())
-            + usize::from(!publication.added_deletes.is_empty() || !removed_deletes.is_empty());
+        let count = rewritten.len() + groups.len();
         let mut artifacts = ArtifactSet::metadata(&root, count, format!("{root}-list.avro"));
         // The catalog writes the next JSON, but its current pointer is already
         // authoritative. Own it before superseding it, including lost responses
@@ -798,6 +846,7 @@ async fn publish_scoped(
             &root,
             manifest_number,
             manifest.content,
+            manifest.partition_spec_id,
             false,
         )?;
         manifest_number += 1;
@@ -827,25 +876,21 @@ async fn publish_scoped(
         }
         writers.push(writer);
     }
-    for (files, removed, content, sequence) in [
-        (
-            publication.added_data,
-            removed_data,
-            ManifestContentType::Data,
-            publication.data_sequence,
-        ),
-        (
-            publication.added_deletes,
-            removed_deletes,
-            ManifestContentType::Deletes,
-            publication.delete_sequence,
-        ),
-    ] {
-        if files.is_empty() && removed.is_empty() {
-            continue;
-        }
-        let mut writer =
-            manifest_writer(table, snapshot_id, &root, manifest_number, content, false)?;
+    for ((content, spec_id), (files, removed)) in groups {
+        let (content, sequence) = if content == 0 {
+            (ManifestContentType::Data, publication.data_sequence)
+        } else {
+            (ManifestContentType::Deletes, publication.delete_sequence)
+        };
+        let mut writer = manifest_writer(
+            table,
+            snapshot_id,
+            &root,
+            manifest_number,
+            content,
+            spec_id,
+            false,
+        )?;
         manifest_number += 1;
         for file in files {
             writer.add_file(file.clone(), sequence)?;
@@ -885,23 +930,22 @@ async fn publish_scoped(
         .map(|next| next - metadata.next_row_id());
     writer.close().await?;
     let mut collector = SnapshotSummaryCollector::default();
+    let spec_of = |file: &DataFile| {
+        metadata
+            .partition_spec_by_id(file.partition_spec_id())
+            .cloned()
+            .ok_or_else(|| invalid(format!("unknown partition spec of {}", file.file_path())))
+    };
     for file in publication
         .added_data
         .iter()
         .chain(publication.added_deletes)
     {
-        collector.add_file(
-            file,
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-        );
+        collector.add_file(file, metadata.current_schema().clone(), spec_of(file)?);
     }
     for path in publication.removed {
-        collector.remove_file(
-            &view.live_files[path].data_file,
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-        );
+        let file = &view.live_files[path].data_file;
+        collector.remove_file(file, metadata.current_schema().clone(), spec_of(file)?);
     }
     let mut properties = publication.properties.clone();
     properties.insert(
@@ -1037,11 +1081,32 @@ pub(crate) fn manifest_writer(
     root: &str,
     number: usize,
     content: ManifestContentType,
+    spec_id: i32,
     if_absent: bool,
 ) -> Result<ManifestWriter> {
-    let output = table
-        .file_io()
-        .new_output(format!("{root}-m{number}.avro"))?;
+    manifest_writer_at(
+        table,
+        snapshot_id,
+        format!("{root}-m{number}.avro"),
+        content,
+        spec_id,
+        if_absent,
+    )
+}
+
+pub(crate) fn manifest_writer_at(
+    table: &Table,
+    snapshot_id: i64,
+    path: String,
+    content: ManifestContentType,
+    spec_id: i32,
+    if_absent: bool,
+) -> Result<ManifestWriter> {
+    let spec = table
+        .metadata()
+        .partition_spec_by_id(spec_id)
+        .ok_or_else(|| invalid(format!("unknown partition spec {spec_id}")))?;
+    let output = table.file_io().new_output(path)?;
     let builder = ManifestWriterBuilder::new(
         if if_absent {
             output.if_absent()
@@ -1050,7 +1115,7 @@ pub(crate) fn manifest_writer(
         },
         Some(snapshot_id),
         table.metadata().current_schema().clone(),
-        table.metadata().default_partition_spec().as_ref().clone(),
+        spec.as_ref().clone(),
     );
     Ok(match (table.metadata().format_version(), content) {
         (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),

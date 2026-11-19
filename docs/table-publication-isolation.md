@@ -103,7 +103,9 @@ see [blocks that require a resync](#blocks-that-require-a-resync). A `replace` s
 whose rows or deletes differ from those it replaced is found only partway
 through reconciliation, so it stays connection-wide, as do missing snapshot
 history, an unknown Flow operation (both can mean restored or foreign local
-state) and a foreign schema or partition-spec change.
+state) and an incompatible foreign schema change. A foreign partition-spec
+change is not an error: work bound to the old default spec is planned again,
+and later files follow the new spec; see [partitioned tables](partitioning.md).
 
 Journal corruption, source connection/slot/identity failures, state-store failures,
 spool limits, a replication message larger than `limits.source_message_bytes`

@@ -266,7 +266,7 @@ target_table = "{name}"
 format_version = {self.args.format_version}
 primary_key = [0]
 append_only = {str(self.args.profile == 'append').lower()}
-columns = [
+{f"partition = {self.args.partition}" + chr(10) if self.args.partition else ""}columns = [
   {{ field_id = 1, name = "id", data_type = "Int64", nullable = false }},
   {{ field_id = 2, name = "version", data_type = "Int64", nullable = false }},
   {{ field_id = 3, name = "payload", data_type = "String", nullable = false }},
@@ -1236,6 +1236,8 @@ def main():
     parser.add_argument("--compactor-interval-ms", type=int, default=3000)
     parser.add_argument("--maintenance-mode", choices=("disabled", "delete-only", "l0-only", "current"),
                         default="current")
+    parser.add_argument("--partition", metavar="TOML",
+                        help='each table\'s partition setting, such as \'["bucket(16, id)"]\'')
     parser.add_argument("--stable-small-soft-files", type=int)
     parser.add_argument("--stable-small-hard-files", type=int)
     parser.add_argument("--manifest-max-count", type=int, default=64)

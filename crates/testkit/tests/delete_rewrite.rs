@@ -3359,7 +3359,7 @@ async fn consolidation_writes_the_files_the_scratch_spool_wrote() {
         case.head.file_io().clone(),
         case.head.metadata().location(),
         &OperationId("spool-reference".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig {
             target_file_bytes: policy.target_file_bytes,
             ..writer.clone()

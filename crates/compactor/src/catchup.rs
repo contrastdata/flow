@@ -404,8 +404,11 @@ pub async fn catch_up(
             !replaced_position_deletes,
         ),
     };
+    let targets = flow_iceberg_ext::TargetPartitions::of_view(table.metadata(), &head)
+        .with_files(&output.data_files);
     (output.delete_files, output.residual_delete_rows) =
-        crate::worker::write_residual_positions(table, &output, residuals, config).await?;
+        crate::worker::write_residual_positions(table, &output, residuals, &targets, config)
+            .await?;
     let finished = Instant::now();
     // The staging thread can overlap the next caller batch. Report the whole
     // mapping interval once; its inner elapsed durations are nested observations.
@@ -1543,6 +1546,7 @@ mod tests {
                         pooled: BTreeSet::new(),
                         breaks: live.clone(),
                         full_size_bytes: 1,
+                        partitions: Default::default(),
                     },
                     reason: crate::PlanReason::Promotion,
                 },
@@ -1578,6 +1582,7 @@ mod tests {
             table,
             output,
             residual_positions(output, &late, &mask, live, false, true),
+            &flow_iceberg_ext::TargetPartitions::uniform(0),
             WriterConfig {
                 batch_rows: 8192,
                 ..WriterConfig::default()
@@ -1942,6 +1947,7 @@ mod tests {
                 false,
                 false,
             ),
+            &flow_iceberg_ext::TargetPartitions::uniform(0),
             config.clone(),
         )
         .await
@@ -1974,6 +1980,7 @@ mod tests {
                 0,
             )
             .unwrap(),
+            &flow_iceberg_ext::TargetPartitions::uniform(0),
             config,
         )
         .await

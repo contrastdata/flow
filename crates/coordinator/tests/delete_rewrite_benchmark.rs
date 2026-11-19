@@ -167,7 +167,7 @@ async fn fixture(settings: &Settings) -> Fixture {
             head.file_io().clone(),
             head.metadata().location(),
             &OperationId(id.clone()),
-            0,
+            flow_iceberg_ext::TargetPartitions::uniform(0),
             WriterConfig::default(),
         )
         .unwrap();

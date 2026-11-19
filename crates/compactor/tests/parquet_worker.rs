@@ -133,7 +133,7 @@ async fn parquet_compaction_applies_position_deletes_and_stock_reader_sees_ident
         initial.table.file_io().clone(),
         initial.table.metadata().location(),
         &OperationId("delete".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig::default(),
     )
     .unwrap();
@@ -611,7 +611,7 @@ async fn per_row_catch_up_masks_late_deletes_on_commit_ordered_inputs() {
         base.file_io().clone(),
         base.metadata().location(),
         &OperationId("late".into()),
-        0,
+        flow_iceberg_ext::TargetPartitions::uniform(0),
         WriterConfig::default(),
     )
     .unwrap();

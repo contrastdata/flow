@@ -170,6 +170,8 @@ async fn describe(
         append_only: preflight.primary_key_attributes.is_empty(),
         priority: Default::default(),
         sort: None,
+        partition: None,
+        partition_convert: Default::default(),
     };
     let mut notes = Vec::new();
     if configured.append_only {
@@ -286,6 +288,8 @@ mod tests {
             append_only: false,
             priority: Default::default(),
             sort: None,
+            partition: None,
+            partition_convert: Default::default(),
         };
         let block = render(&table, &["a note\nspanning lines".into()]).unwrap();
         assert!(block.contains("# a note spanning lines\n"));
