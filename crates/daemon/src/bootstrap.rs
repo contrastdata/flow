@@ -178,6 +178,9 @@ pub async fn initialize(config: Config) -> Result<()> {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => prepare_source(&config, &store, catalog.as_ref()).await?,
         };
+        let mut config = config.clone();
+        // Added tables are copied by `run`, beside capture.
+        order_tables(&mut config, &boot)?;
         validate_config(&config, &boot)?;
         resume(&config, store, catalog, &mut boot).await
     }
@@ -236,6 +239,7 @@ pub(crate) fn validate_column_selection(config: &Config, boot: &Bootstrap) -> Re
                 .tables
                 .iter()
                 .enumerate()
+                .take(boot.schemas.len())
                 .filter_map(|(index, table)| table.projection().map(|_| index))
                 .collect::<Vec<_>>(),
         crate::exit::config(
@@ -256,13 +260,18 @@ pub(crate) fn validate_identity(config: &Config, boot: &Bootstrap) -> Result<()>
     Ok(())
 }
 
+/// The configuration's first tables are the bootstrap's, in its order (see
+/// [`order_tables`]); a completed PostgreSQL bootstrap may be followed by
+/// added tables.
 pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
     validate_identity(config, boot)?;
     ensure!(
-        boot.schemas.len() == config.tables.len() && boot.targets.len() == config.tables.len(),
+        boot.targets.len() == boot.schemas.len()
+            && (boot.schemas.len() == config.tables.len()
+                || boot.copied && boot.schemas.len() < config.tables.len()),
         crate::exit::config("configured source tables differ from durable bootstrap")
     );
-    for (index, configured) in config.tables.iter().enumerate() {
+    for (index, configured) in config.tables.iter().enumerate().take(boot.schemas.len()) {
         ensure!(
             configured.schema(boot.schemas[index].table_id.0) == boot.schemas[index]
                 && (
@@ -273,6 +282,51 @@ pub(crate) fn validate_config(config: &Config, boot: &Bootstrap) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Create `configured`'s target if it does not exist and apply its declared
+/// layout. The target must be empty and have the table's schema: a base is
+/// copied into it next. Returns its UUID.
+async fn empty_target(
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    configured: &crate::config::Table,
+    schema: &TableSchema,
+) -> Result<uuid::Uuid> {
+    let id = target(&configured.target_namespace, &configured.target_table)?;
+    if !catalog.namespace_exists(&id.namespace).await? {
+        catalog
+            .create_namespace(&id.namespace, HashMap::new())
+            .await?;
+    }
+    if !catalog.table_exists(&id).await? {
+        let created = catalog
+            .create_table(
+                &id.namespace,
+                crate::services::table_creation(configured, schema, id.name.clone())?,
+            )
+            .await?;
+        ensure!(
+            created.metadata().format_version() == configured.format_version,
+            "catalog created target with format {}, requested {}",
+            created.metadata().format_version(),
+            configured.format_version,
+        );
+    }
+    let existing = catalog.load_table(&id).await?;
+    let existing =
+        crate::schema::ensure_table_sort_order(store, catalog, &existing, configured, schema)
+            .await?;
+    let existing =
+        crate::schema::ensure_table_partition_spec(store, catalog, &existing, configured, schema)
+            .await?;
+    ensure!(
+        existing.metadata().current_snapshot_id().is_none()
+            && *existing.metadata().current_schema().as_ref()
+                == flow_materializer::iceberg_schema(schema)?,
+        "initial target must be empty and match the configured schema"
+    );
+    Ok(existing.metadata().uuid())
 }
 
 async fn prepare_source(
@@ -303,41 +357,8 @@ async fn prepare_source(
         .await?;
         let schema = configured.schema(relation.id);
         validate_source_table(&sql, configured, &schema).await?;
-        let id = target(&configured.target_namespace, &configured.target_table)?;
-        if !catalog.namespace_exists(&id.namespace).await? {
-            catalog
-                .create_namespace(&id.namespace, HashMap::new())
-                .await?;
-        }
-        if !catalog.table_exists(&id).await? {
-            let created = catalog
-                .create_table(
-                    &id.namespace,
-                    crate::services::table_creation(configured, &schema, id.name.clone())?,
-                )
-                .await?;
-            ensure!(
-                created.metadata().format_version() == configured.format_version,
-                "catalog created target with format {}, requested {}",
-                created.metadata().format_version(),
-                configured.format_version,
-            );
-        }
-        let existing = catalog.load_table(&id).await?;
-        let existing =
-            crate::schema::ensure_table_sort_order(store, catalog, &existing, configured, &schema)
-                .await?;
-        let existing = crate::schema::ensure_table_partition_spec(
-            store, catalog, &existing, configured, &schema,
-        )
-        .await?;
-        ensure!(
-            existing.metadata().current_snapshot_id().is_none()
-                && *existing.metadata().current_schema().as_ref()
-                    == flow_materializer::iceberg_schema(&schema)?,
-            "initial target must be empty and match the configured schema"
-        );
-        target_uuids.push(existing.metadata().uuid());
+        let uuid = empty_target(store, catalog, configured, &schema).await?;
+        target_uuids.push(uuid);
         // Even an empty, not-yet-copied table has explicit recovery authority.
         store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
         schemas.push(schema);
@@ -624,7 +645,8 @@ pub(crate) async fn resume(
                 schema.table_id,
                 copy.schema_version,
             )?;
-            if let Some((staged, transaction)) = staged_copy(config, &copy_schema, &copy, &reader)?
+            if let Some((staged, transaction)) =
+                staged_copy(config, &copy_schema, &copy, Some(&reader))?
             {
                 copy.phase = CopyPhase::Staged;
                 copy.save(&store, schema.table_id)?;
@@ -855,10 +877,11 @@ fn staged_copy(
     config: &Config,
     schema: &TableSchema,
     copy: &TableCopy,
-    main: &JournalReader,
+    main: Option<&JournalReader>,
 ) -> Result<Option<(JournalReader, SourceTransaction)>> {
     let reader = if copy.staging.is_empty() {
-        main.clone()
+        main.context("a legacy initial copy needs the source journal")?
+            .clone()
     } else {
         let path = copy.path(config, schema.table_id)?;
         if !path.is_dir() {
@@ -1302,9 +1325,391 @@ async fn copy_and_publish(
     Ok((schema.table_id, snapshot.unwrap_or(0)))
 }
 
+/// Order `config.tables` as the durable bootstrap records them, followed by
+/// tables it does not record yet, and return how many tables it records.
+/// Everything that pairs configured tables with bootstrap schemas does so by
+/// position. A recorded table missing from the configuration still requires a
+/// resync; only a PostgreSQL source with a completed bootstrap accepts added
+/// tables, which [`register_additions`] then records.
+pub(crate) fn order_tables(config: &mut Config, boot: &Bootstrap) -> Result<usize> {
+    let mut remaining = std::mem::take(&mut config.tables);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for (namespace, name) in &boot.targets {
+        let position = remaining
+            .iter()
+            .position(|table| {
+                table.target_namespace == *namespace && table.target_table == *name
+            })
+            .ok_or_else(|| {
+                crate::exit::config(format!(
+                    "configured tables changed: target {}.{} was removed; explicit resynchronization is required",
+                    namespace.join("."),
+                    name
+                ))
+            })?;
+        ordered.push(remaining.remove(position));
+    }
+    let recorded = ordered.len();
+    if !remaining.is_empty() {
+        ensure!(
+            boot.copied,
+            crate::exit::config(
+                "tables were added before the initial copy completed; finish init with the original tables first"
+            )
+        );
+    }
+    ordered.extend(remaining);
+    config.tables = ordered;
+    Ok(recorded)
+}
+
+/// The durable intent to copy an added table: its copy has not started. A
+/// cut of zero cannot be a snapshot cut.
+fn addition_intent(schema: &TableSchema) -> TableCopy {
+    TableCopy {
+        cut: PgLsn(0),
+        staging: String::new(),
+        phase: CopyPhase::Copying,
+        rows: 0,
+        schema_version: schema.version,
+    }
+}
+
+/// Record the configured tables after the first `recorded` in the bootstrap,
+/// each with an empty target and the intent to copy it. A table must be in
+/// the publication first: its changes after the copy's snapshot cut come
+/// from the running slot. Copies run later, beside capture, through
+/// [`copy_addition`].
+pub(crate) async fn register_additions(
+    config: &Config,
+    store: &StateStore,
+    catalog: &dyn Catalog,
+    boot: &mut Bootstrap,
+    recorded: usize,
+) -> Result<Vec<TableId>> {
+    let sql = connect(config, false).await?;
+    let mut schemas = boot.schemas.clone();
+    for configured in &config.tables[recorded..] {
+        let (relation, _) = fetch_relation(
+            &sql,
+            &configured.source_namespace,
+            &configured.source_table,
+            !configured.append_only,
+        )
+        .await?;
+        let schema = configured.schema(relation.id);
+        ensure!(
+            schemas
+                .iter()
+                .all(|known| known.table_id != schema.table_id),
+            crate::exit::config(format!(
+                "{}.{} is already replicated under another target",
+                configured.source_namespace, configured.source_table
+            ))
+        );
+        validate_source_table(&sql, configured, &schema).await?;
+        schemas.push(schema);
+    }
+    // Every added table must be published as configured before it is
+    // recorded; a violation would otherwise block it for a resync.
+    let violations = validate_publication(&sql, config, &schemas, false).await?;
+    let added: Vec<_> = schemas[recorded..]
+        .iter()
+        .map(|schema| schema.table_id)
+        .collect();
+    if let Some(violation) = violations
+        .iter()
+        .find(|violation| added.contains(&violation.table))
+    {
+        return Err(crate::exit::config(format!(
+            "added table {} cannot be captured: {}; add it to publication {:?} as configured before adding it to the configuration",
+            violation.table.0, violation.reason, config.source.publication
+        )));
+    }
+    for (offset, schema) in schemas[recorded..].iter().enumerate() {
+        let index = recorded + offset;
+        let configured = &config.tables[index];
+        let uuid = empty_target(store, catalog, configured, schema).await?;
+        // The intent precedes the bootstrap record: a table the bootstrap
+        // lists without a published copy is always copied.
+        addition_intent(schema).save(store, schema.table_id)?;
+        store.complete_noop(&schema.table_id, PgLsn(0), schema.version)?;
+        boot.schemas.push(schema.clone());
+        boot.targets.push((
+            configured.target_namespace.clone(),
+            configured.target_table.clone(),
+        ));
+        boot.target_uuids.push(uuid);
+        if configured.projection().is_some() {
+            boot.explicit_projections.push(index);
+        }
+        persist_bootstrap(store, boot)?;
+        tracing::info!(
+            event = "table_added",
+            table_id = schema.table_id.0,
+            source = %format!("{}.{}", configured.source_namespace, configured.source_table),
+            target = %format!("{}.{}", configured.target_namespace.join("."), configured.target_table),
+            "table added; its initial copy runs beside capture"
+        );
+    }
+    Ok(added)
+}
+
+/// Tables of a completed bootstrap whose copy has not been published: added
+/// tables, which must not publish their changes before their base.
+pub(crate) fn pending_copies(store: &StateStore, boot: &Bootstrap) -> Result<Vec<TableId>> {
+    if !boot.copied {
+        return Ok(Vec::new());
+    }
+    let mut pending = Vec::new();
+    for schema in &boot.schemas {
+        if TableCopy::load(store, schema.table_id)?
+            .is_some_and(|copy| copy.phase != CopyPhase::Published)
+        {
+            pending.push(schema.table_id);
+        }
+    }
+    Ok(pending)
+}
+
+/// Copy an added table under a temporary slot's snapshot and publish its base
+/// at the snapshot's cut, while capture and other tables keep running. Its
+/// changes after the cut are already journaled from the running slot and
+/// publish afterwards; those at or before it are covered by the base. Safe to
+/// call again after any failure: it recovers an unfinished publication,
+/// publishes a complete staged copy, and otherwise copies again from a new
+/// snapshot. Returns the cut.
+pub(crate) async fn copy_addition(
+    config: &Config,
+    store: &StateStore,
+    catalog: Arc<dyn Catalog>,
+    index: usize,
+    schema: &TableSchema,
+    uuid: uuid::Uuid,
+) -> Result<PgLsn> {
+    let configured = &config.tables[index];
+    let id = target(&configured.target_namespace, &configured.target_table)?;
+    let table = catalog.load_table(&id).await?;
+    ensure!(
+        table.metadata().uuid() == uuid,
+        crate::exit::resync("added table's target was replaced during its copy")
+    );
+    let sketches = configured
+        .sketch_selection(&config.statistics, schema)?
+        .map(|selection| HashMap::from([(schema.table_id, Arc::new(selection))]))
+        .unwrap_or_default();
+    let publisher = TablePublisher::new(
+        store.clone(),
+        catalog.clone(),
+        WriterConfig {
+            target_file_bytes: usize::try_from(config.compaction.l1_target_bytes)
+                .context("initial target file size exceeds platform limit")?,
+            ..crate::services::compacted_writer_config(config)
+        },
+        config.limits.batch_rows,
+        config.limits.batch_bytes,
+    )?
+    .with_sketches(sketches);
+    if let Some(operation) = store.table_state(&schema.table_id)?.pending_operation {
+        let record = store
+            .operation(&operation)?
+            .context("added table's fence has no operation")?;
+        if record.phase == OperationPhase::Building {
+            store.discard_uncommitted(&operation)?;
+        } else {
+            publisher.recover(&table, &operation).await?;
+        }
+    }
+    let mut copy =
+        TableCopy::load(store, schema.table_id)?.context("added table has no copy record")?;
+    let state = store.table_state(&schema.table_id)?;
+    if copy.cut.0 > 0 && state.materialized_lsn >= copy.cut && state.pending_operation.is_none() {
+        // Published before the record said so.
+        copy.phase = CopyPhase::Published;
+        copy.save(store, schema.table_id)?;
+        if !copy.staging.is_empty() {
+            remove_staging(config, schema.table_id, &copy)?;
+        }
+        return Ok(copy.cut);
+    }
+    if copy.phase == CopyPhase::Published {
+        return Ok(copy.cut);
+    }
+    if copy.cut.0 > 0 {
+        let copy_schema = flow_coordinator::load_source_schema(
+            store,
+            &SourceId(config.source.id.clone()),
+            schema.table_id,
+            copy.schema_version,
+        )?;
+        if let Some(staged) = staged_copy(config, &copy_schema, &copy, None)? {
+            copy.phase = CopyPhase::Staged;
+            copy.save(store, schema.table_id)?;
+            copy_and_publish(
+                config,
+                store,
+                &publisher,
+                catalog.as_ref(),
+                CopyWork {
+                    schema: copy_schema,
+                    table,
+                    index,
+                    copy: copy.clone(),
+                    staged: Some(staged),
+                    exported: None,
+                    streams: COPY_STREAMS,
+                },
+            )
+            .await?;
+            return Ok(copy.cut);
+        }
+    }
+    ensure!(
+        state.snapshot_id.is_none() && table.metadata().current_snapshot_id().is_none(),
+        "cannot copy an added table whose target already has data"
+    );
+    let replication = connect(config, true).await?;
+    let (mut keeper_sql, keeper_connection) = connect_owned(config, false).await?;
+    let snapshot = export_temporary_snapshot(
+        &replication,
+        &mut keeper_sql,
+        &format!("flow_add_{}", uuid::Uuid::new_v4().simple()),
+    )
+    .await?;
+    snapshot
+        .lock_table(&configured.source_namespace, &configured.source_table)
+        .await?;
+    let mut registry = crate::schema::SchemaRegistry::new(
+        store.clone(),
+        SourceId(config.source.id.clone()),
+        std::slice::from_ref(schema),
+    )?;
+    let copy_schema = registry
+        .initialize(snapshot.transaction(), std::slice::from_ref(configured))
+        .await?
+        .into_iter()
+        .next()
+        .context("added table has no schema at its snapshot")?;
+    let exported = (snapshot.reexport().await?, snapshot.consistent_lsn);
+    if !copy.staging.is_empty() {
+        remove_staging(config, schema.table_id, &copy)?;
+    }
+    std::fs::create_dir_all(config.state_dir.join("bootstrap"))?;
+    std::fs::File::open(&config.state_dir)?.sync_all()?;
+    copy = TableCopy {
+        cut: snapshot.consistent_lsn,
+        staging: format!("table-{}-{}", schema.table_id.0, uuid::Uuid::new_v4()),
+        phase: CopyPhase::Copying,
+        rows: 0,
+        schema_version: copy_schema.version,
+    };
+    copy.save(store, schema.table_id)?;
+    // The keeper's re-export holds the snapshot; the temporary slot goes
+    // with its replication session.
+    drop(replication);
+    tracing::info!(event = "table_copy_started", table_id = schema.table_id.0, lsn = %copy.cut, "added table COPY started at its snapshot cut");
+    let cut = copy.cut;
+    copy_and_publish(
+        config,
+        store,
+        &publisher,
+        catalog.as_ref(),
+        CopyWork {
+            schema: copy_schema,
+            table,
+            index,
+            copy,
+            staged: None,
+            exported: Some(exported),
+            streams: COPY_STREAMS,
+        },
+    )
+    .await?;
+    let cleanup = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot.cancel())
+        .await
+        .context("snapshot keeper cleanup timed out")
+        .and_then(|result| result.map_err(anyhow::Error::from));
+    if let Err(error) = cleanup {
+        tracing::warn!(event = "table_copy_snapshot_cleanup_failed", %error,
+            "failed to release the added table's snapshot keeper; closing its connection");
+    }
+    drop(keeper_connection);
+    Ok(cut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(config: &Config, name: &str) -> crate::config::Table {
+        let mut table = config.tables[0].clone();
+        table.source_table = name.into();
+        table.target_table = name.into();
+        table
+    }
+
+    fn recorded(config: &Config, names: &[&str], copied: bool) -> Bootstrap {
+        Bootstrap {
+            source_id: config.source.id.clone(),
+            explicit_projections: Vec::new(),
+            slot: config.source.slot.clone(),
+            publication: config.source.publication.clone(),
+            schemas: (0..names.len())
+                .map(|index| named(config, names[index]).schema(index as u32 + 1))
+                .collect(),
+            targets: names
+                .iter()
+                .map(|name| {
+                    (
+                        config.tables[0].target_namespace.clone(),
+                        (*name).to_owned(),
+                    )
+                })
+                .collect(),
+            target_uuids: vec![uuid::Uuid::nil(); names.len()],
+            consistent_lsn: Some(PgLsn(1)),
+            copied,
+            layout: 1,
+        }
+    }
+
+    /// The configuration is read in bootstrap order, with added tables after,
+    /// wherever they appear; a removed table still requires a resync.
+    #[test]
+    fn configured_tables_follow_the_bootstrap_and_added_ones_follow_it() {
+        let example: Config = toml::from_str(include_str!("../../../examples/flow.toml")).unwrap();
+        let boot = recorded(&example, &["orders", "items"], true);
+        let mut config = example.clone();
+        config.tables = vec![
+            named(&example, "items"),
+            named(&example, "invoices"),
+            named(&example, "orders"),
+        ];
+        assert_eq!(order_tables(&mut config, &boot).unwrap(), 2);
+        let order: Vec<_> = config
+            .tables
+            .iter()
+            .map(|table| table.target_table.as_str())
+            .collect();
+        assert_eq!(order, ["orders", "items", "invoices"]);
+        validate_config(&config, &boot).unwrap();
+
+        let mut removed = example.clone();
+        removed.tables = vec![named(&example, "orders"), named(&example, "invoices")];
+        let error = order_tables(&mut removed, &boot).unwrap_err();
+        assert!(format!("{error:#}").contains("was removed"), "{error:#}");
+
+        let copying = recorded(&example, &["orders"], false);
+        let mut early = example.clone();
+        early.tables = vec![named(&example, "orders"), named(&example, "items")];
+        let error = order_tables(&mut early, &copying).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("before the initial copy"),
+            "{error:#}"
+        );
+        // An unfinished bootstrap still requires its exact table set.
+        assert!(validate_config(&early, &copying).is_err());
+    }
     use flow_coordinator::{AckMode, JournalDurability};
     use flow_state_store::StateStoreOptions;
     use iceberg::TableCreation;
@@ -1549,7 +1954,7 @@ mod tests {
         let (main, _) =
             Journal::open(root.path().join("journal"), journal_config(&config)).unwrap();
         assert!(
-            staged_copy(&config, &schema, &copy, &main.reader())
+            staged_copy(&config, &schema, &copy, Some(&main.reader()))
                 .unwrap()
                 .is_none()
         );

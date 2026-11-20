@@ -133,7 +133,7 @@ example alerting rules.
 
 ## Resynchronize a source
 
-Several changes require resynchronization: a changed table set, a publication
+Several changes require resynchronization: a removed table, a publication
 violation (`publication-resync-required.json` or a `publication_changed` block), a lost or invalidated slot, a
 changed source identity (failover, major upgrade, restore), a table blocked for
 a heap rewrite or TRUNCATE, incompatible schema changes, and another writer's
@@ -159,14 +159,38 @@ incarnation catches up.
 
 ## Add or remove tables
 
-The configured table set is fixed for a state directory. To add tables without
-recopying existing ones, run another Flow instance with its own state
-directory, slot and publication (or the same administrator-managed publication)
-for only the new tables. Each instance holds one more slot and WAL sender.
+To add a PostgreSQL table to a running source, without recopying the others
+or a new slot:
 
-To remove a table, or to merge instances, resynchronize with the new table set.
-Until then, keep the removed table in the publication: removing a configured
-table from the publication blocks that table (`publication_changed`).
+1. Add the table to the publication as configured (all columns, no row
+   filter), unless the publication already includes it, as `FOR ALL TABLES`
+   does: `ALTER PUBLICATION flow_pub ADD TABLE public.invoices;`.
+2. Add its `[[tables]]` block (`discover` generates one), in any position.
+3. Restart the daemon with `run`.
+
+On start, Flow records the table, creates its empty target, and copies it
+beside capture: it takes a temporary slot's snapshot, copies the table in page
+ranges as the initial copy does, and publishes the base at the snapshot's cut
+(`table_added`, `table_copy_started`, `table_copy_completed`). Its changes
+before the cut are in the base; those after it are journaled from the running
+slot and publish once the base is. Other tables keep publishing throughout.
+
+While a table copies, its journaled changes hold the source acknowledgement,
+so the slot retains WAL for the length of the copy; the snapshot holds back
+vacuum on the source as the initial copy does. Copies run one table at a time
+with up to four COPY sessions. A stopped daemon resumes the copy on the next
+start: it publishes a complete staged copy, or copies again from a new
+snapshot. `flow_tables_copying` counts tables still copying. A copy that fails
+for a reason other than an interrupted connection stops the daemon with its
+cause, since the table would otherwise hold the acknowledgement indefinitely.
+
+The table must not already be another configured table's source, and its
+target must be absent or empty. A table added before the initial copy of the
+source completes is refused; finish `init` with the original tables first.
+
+To remove a table, resynchronize with the new table set. Until then, keep the
+removed table in the publication: removing a configured table from the
+publication blocks that table (`publication_changed`).
 
 ## Planned source maintenance
 

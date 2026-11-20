@@ -23,6 +23,7 @@ pub(crate) struct Observation {
     last_export: Option<(Instant, bool)>,
     source_health: SourceHealthStatus,
     blocked_tables: Vec<BlockedTable>,
+    copying_tables: Vec<flow_model::TableId>,
     table_progress: Vec<TableProgress>,
     table_sources: std::collections::BTreeMap<TableId, (String, String)>,
     started_at: SystemTime,
@@ -62,6 +63,7 @@ impl Observation {
             last_export: None,
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
+            copying_tables: Vec::new(),
             table_progress: Vec::new(),
             table_sources: Default::default(),
             started_at: SystemTime::now(),
@@ -132,6 +134,12 @@ impl Observation {
         }
         self.blocked_tables = blocked.records().cloned().collect();
         Ok(())
+    }
+
+    /// Added tables still copying their base.
+    pub(crate) fn set_copying(&mut self, tables: impl IntoIterator<Item = flow_model::TableId>) {
+        self.copying_tables = tables.into_iter().collect();
+        self.copying_tables.sort_unstable();
     }
 
     /// Start a sample of the process-wide memory budgets (see
@@ -222,7 +230,11 @@ impl Observation {
             captured,
             ready,
             self.source_health,
-            (&self.blocked_tables, &self.table_progress),
+            (
+                &self.blocked_tables,
+                &self.table_progress,
+                &self.copying_tables,
+            ),
         )?;
         if self.last_export.is_some_and(|(last, was_ready)| {
             ready == was_ready && now.duration_since(last) < EXPORT_INTERVAL
@@ -719,6 +731,7 @@ mod tests {
             last_export: None,
             source_health: SourceHealthStatus::Unknown,
             blocked_tables: Vec::new(),
+            copying_tables: Vec::new(),
             table_progress: Vec::new(),
             table_sources: Default::default(),
             started_at: SystemTime::now(),
