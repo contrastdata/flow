@@ -1066,6 +1066,10 @@ fn key_order<'a>(
     };
     let order_id = spec.iceberg_order_id()?;
     let field = schema.columns[leading.column].field_id;
+    let float = matches!(
+        schema.columns[leading.column].data_type,
+        flow_model::ColumnType::Float64
+    );
     let mut ranges = Vec::with_capacity(files.len());
     for file in files {
         let entry = view
@@ -1079,12 +1083,7 @@ fn key_order<'a>(
         ) else {
             return Ok(None);
         };
-        if data.sort_order_id() != Some(order_id)
-            || data
-                .null_value_counts()
-                .get(&field)
-                .is_some_and(|nulls| *nulls > 0)
-        {
+        if !concatenable(data, field, order_id, float) {
             return Ok(None);
         }
         ranges.push((lower.clone(), upper.clone(), file));
@@ -1106,6 +1105,16 @@ fn key_order<'a>(
         }
     });
     Ok(disjoint.then(|| ranges.into_iter().map(|(_, _, file)| file).collect()))
+}
+
+/// Whether a stamped file's bounds on its leading sort field cover every row,
+/// so files with disjoint bounds concatenate in order. Bounds leave out nulls
+/// and, for floats, NaN, so their counts must be recorded and zero; a missing
+/// count is unknown, not zero.
+fn concatenable(data: &iceberg::spec::DataFile, field: i32, order_id: i32, float: bool) -> bool {
+    data.sort_order_id() == Some(order_id)
+        && data.null_value_counts().get(&field) == Some(&0)
+        && (!float || data.nan_value_counts().get(&field) == Some(&0))
 }
 
 /// Whether every input is stamped with `spec`'s order, which its writer set
@@ -1818,6 +1827,51 @@ mod tests {
     use super::*;
     use flow_model::PrimaryKey;
     use flow_state_store::StateStoreOptions;
+
+    fn stamped_file(nulls: Option<u64>, nans: Option<u64>) -> iceberg::spec::DataFile {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("data.parquet".into())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .file_size_in_bytes(1 << 20)
+            .record_count(100)
+            .sort_order_id(1)
+            .null_value_counts(nulls.into_iter().map(|count| (7, count)).collect())
+            .nan_value_counts(nans.into_iter().map(|count| (7, count)).collect())
+            .build()
+            .unwrap()
+    }
+
+    /// Bounds leave out nulls and NaN, so a file with any of them, or with
+    /// no recorded count, may hold rows outside its bounds.
+    #[test]
+    fn files_concatenate_only_with_recorded_zero_null_and_nan_counts() {
+        assert!(concatenable(&stamped_file(Some(0), None), 7, 1, false));
+        assert!(concatenable(&stamped_file(Some(0), Some(0)), 7, 1, true));
+        assert!(
+            !concatenable(&stamped_file(Some(0), Some(0)), 7, 2, true),
+            "other order"
+        );
+        assert!(
+            !concatenable(&stamped_file(Some(3), Some(0)), 7, 1, true),
+            "nulls"
+        );
+        assert!(
+            !concatenable(&stamped_file(None, Some(0)), 7, 1, true),
+            "unknown nulls"
+        );
+        assert!(
+            !concatenable(&stamped_file(Some(0), Some(2)), 7, 1, true),
+            "NaN"
+        );
+        assert!(
+            !concatenable(&stamped_file(Some(0), None), 7, 1, true),
+            "unknown NaN"
+        );
+    }
 
     fn delta(key: u8, position: u64) -> IndexDelta {
         IndexDelta {

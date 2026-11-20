@@ -52,6 +52,9 @@ const RECORD_VERSION: u8 = 1;
 /// Encoded chunks kept across reads, in bytes. At about two bytes per run
 /// this holds some 30 million runs.
 const CHUNK_CACHE_BYTES: usize = 64 << 20;
+/// Decoded remap records kept, by their encoded size. Legacy records hold
+/// their runs inline, so headers alone are not always small.
+const HEADER_CACHE_BYTES: usize = 32 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemapTarget {
@@ -823,12 +826,65 @@ impl ChunkCache {
     }
 }
 
+/// Decoded remap records by (table, file), bounded in their encoded bytes and
+/// evicted oldest first. A reader on an older snapshot may decode a record
+/// cleanup has just forgotten; the bound keeps such entries from
+/// accumulating. An evicted record is decoded again from the caller's read.
+struct HeaderCache {
+    entries: HashMap<(TableId, FileId), (Arc<CommittedRemap>, usize)>,
+    order: std::collections::VecDeque<(TableId, FileId)>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl Default for HeaderCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            limit: HEADER_CACHE_BYTES,
+        }
+    }
+}
+
+impl HeaderCache {
+    fn get(&self, key: &(TableId, FileId)) -> Option<Arc<CommittedRemap>> {
+        self.entries.get(key).map(|(remap, _)| remap.clone())
+    }
+
+    fn insert(&mut self, key: (TableId, FileId), remap: Arc<CommittedRemap>, encoded: usize) {
+        let bytes = encoded + 128;
+        if bytes > self.limit || self.entries.contains_key(&key) {
+            return;
+        }
+        while self.bytes + bytes > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, evicted)) = self.entries.remove(&oldest) {
+                self.bytes -= evicted;
+            }
+        }
+        self.bytes += bytes;
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (remap, bytes));
+    }
+
+    fn forget(&mut self, key: &(TableId, FileId)) {
+        if let Some((_, bytes)) = self.entries.remove(key) {
+            self.bytes -= bytes;
+            self.order.retain(|entry| entry != key);
+        }
+    }
+}
+
 /// Decoded remaps are immutable once committed. Visibility is still decided
 /// by a read in the caller's view; the cache only avoids decoding again.
 #[derive(Default)]
 pub(crate) struct RemapCache {
-    /// Committed headers: small, one per retired file.
-    decoded: Mutex<HashMap<(TableId, FileId), Arc<CommittedRemap>>>,
+    /// Committed records, bounded in bytes.
+    decoded: Mutex<HeaderCache>,
     chunks: Mutex<ChunkCache>,
     /// Per-table graph sizes, computed and invalidated under the row lock.
     stats: Mutex<HashMap<TableId, RemapStats>>,
@@ -839,13 +895,13 @@ impl RemapCache {
     fn decoded(&self, table: TableId, file: &FileId, bytes: &[u8]) -> Result<Arc<CommittedRemap>> {
         let key = (table, file.clone());
         if let Some(remap) = self.decoded.lock().map_err(|_| Error::Poisoned)?.get(&key) {
-            return Ok(remap.clone());
+            return Ok(remap);
         }
         let remap = Arc::new(CommittedRemap::decode(bytes)?);
         self.decoded
             .lock()
             .map_err(|_| Error::Poisoned)?
-            .insert(key, remap.clone());
+            .insert(key, remap.clone(), bytes.len());
         Ok(remap)
     }
 
@@ -853,7 +909,7 @@ impl RemapCache {
         self.decoded
             .lock()
             .map_err(|_| Error::Poisoned)?
-            .remove(&(table, file.clone()));
+            .forget(&(table, file.clone()));
         self.chunks
             .lock()
             .map_err(|_| Error::Poisoned)?
@@ -2737,6 +2793,50 @@ mod tests {
         cache.forget_file(TABLE, &FileId("f".into()));
         assert_eq!(
             (cache.bytes, cache.chunks.len(), cache.order.len()),
+            (0, 0, 0)
+        );
+    }
+
+    /// Decoded records stay within the header cache's byte limit, so ones a
+    /// reader re-decodes after cleanup forgot them cannot accumulate.
+    #[test]
+    fn the_header_cache_stays_within_its_byte_limit() {
+        let runs = vec![RemapRun {
+            old_start: 0,
+            new_start: 0,
+            len: 4,
+            target: 0,
+        }];
+        let targets = [RemapTarget {
+            data_file_id: FileId("b".into()),
+            data_sequence_number: 1,
+            spec_id: 0,
+            partition: Vec::new(),
+        }];
+        let record = bincode::serialize(&LegacyRecord {
+            source: &FileId("a".into()),
+            targets: &targets,
+            runs: &runs,
+        })
+        .unwrap();
+        let remap = Arc::new(CommittedRemap::decode(&record).unwrap());
+        let mut cache = HeaderCache {
+            limit: 10 * (record.len() + 128),
+            ..HeaderCache::default()
+        };
+        for file in 0..50 {
+            let key = (TABLE, FileId(format!("f{file}")));
+            cache.insert(key, remap.clone(), record.len());
+            assert!(cache.bytes <= cache.limit);
+        }
+        assert_eq!(cache.entries.len(), 10);
+        assert!(cache.get(&(TABLE, FileId("f49".into()))).is_some());
+        assert!(cache.get(&(TABLE, FileId("f0".into()))).is_none());
+        for file in 40..50 {
+            cache.forget(&(TABLE, FileId(format!("f{file}"))));
+        }
+        assert_eq!(
+            (cache.bytes, cache.entries.len(), cache.order.len()),
             (0, 0, 0)
         );
     }
