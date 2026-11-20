@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by Contrast Flow: truncate LargeBinary arrays as Binary.
+
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
@@ -131,6 +133,18 @@ impl TransformFunction for Truncate {
                     input
                         .as_any()
                         .downcast_ref::<arrow_array::BinaryArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
+                );
+                Ok(Arc::new(res))
+            }
+            DataType::LargeBinary => {
+                let len = self.width as usize;
+                let res: arrow_array::LargeBinaryArray = arrow_array::LargeBinaryArray::from_iter(
+                    input
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
                         .unwrap()
                         .iter()
                         .map(|v| v.map(|v| Self::truncate_binary(v, len))),

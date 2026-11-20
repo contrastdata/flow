@@ -19,9 +19,14 @@ async fn connect(config: &Config) -> (Client, JoinHandle<()>) {
     (client, task)
 }
 
+/// Unique across this binary's parallel tests and across runs: the clock
+/// alone repeats when two tests read it within its resolution.
 fn slot_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     format!(
-        "snapshot_slots_{}",
+        "snapshot_slots_{}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
