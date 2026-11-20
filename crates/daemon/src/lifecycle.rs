@@ -29,6 +29,9 @@ pub(crate) struct Status {
     blocked_tables: Vec<BlockedTable>,
     #[serde(default)]
     table_progress: Vec<TableProgress>,
+    /// Added tables whose base is still being copied; they publish after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    copying_tables: Vec<TableId>,
     #[serde(default)]
     state: ProcessState,
     /// Why the last process stopped; kept until a later process is running.
@@ -401,7 +404,7 @@ pub(crate) fn emit_running(
     captured: PgLsn,
     ready: bool,
     source_health: SourceHealthStatus,
-    tables: (&[BlockedTable], &[TableProgress]),
+    tables: (&[BlockedTable], &[TableProgress], &[TableId]),
 ) -> Result<()> {
     writer.submit(
         config.state_dir.join("status.json"),
@@ -416,6 +419,7 @@ pub(crate) fn emit_running(
             source_health,
             blocked_tables: tables.0.to_vec(),
             table_progress: tables.1.to_vec(),
+            copying_tables: tables.2.to_vec(),
             state: ProcessState::Running,
             last_error: None,
             durability: None,
@@ -517,6 +521,7 @@ fn update(config: &Config, change: impl FnOnce(&mut Status)) -> Result<()> {
         source_health: SourceHealthStatus::Unknown,
         blocked_tables: Vec::new(),
         table_progress: Vec::new(),
+        copying_tables: Vec::new(),
         state: ProcessState::Unknown,
         last_error: None,
         durability: None,
@@ -684,7 +689,7 @@ mod status_tests {
             PgLsn(1),
             true,
             SourceHealthStatus::Healthy,
-            (&[], &[]),
+            (&[], &[], &[]),
         )
         .unwrap();
         let running = status(&config);
@@ -718,7 +723,7 @@ mod status_tests {
                 PgLsn(captured),
                 true,
                 SourceHealthStatus::Healthy,
-                (&[], &[]),
+                (&[], &[], &[]),
             )
         };
         for captured in 1..=64 {

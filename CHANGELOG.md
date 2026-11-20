@@ -85,6 +85,12 @@ From earlier development builds of `main`:
 - New source columns are accepted unless their `ADD COLUMN` default fills
   existing rows or the table is rewritten.
 - PostgreSQL type mappings, explicit column selection and pgvector.
+- Tables can be added to a running source without a resync. Add the table to
+  the publication and its `[[tables]]` block to the configuration, then
+  restart: Flow copies it beside capture under a temporary slot's snapshot and
+  publishes its base at the snapshot's cut, while other tables keep
+  publishing; its changes after the cut follow. See
+  [Add or remove tables](docs/operations.md#add-or-remove-tables).
 - Durable heartbeats that advance idle sources' replication slots.
 - A full ingress journal pauses capture until publication drains
   (`flow_capture_journal_full`) instead of stopping the daemon.

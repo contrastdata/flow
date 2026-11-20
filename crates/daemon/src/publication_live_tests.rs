@@ -99,6 +99,38 @@ async fn with_seeded_daemon<F, Fut>(
     F: FnOnce(Config, String) -> Fut,
     Fut: Future<Output = ()>,
 {
+    with_source(
+        url,
+        sql,
+        label,
+        seed,
+        configure,
+        |config, name| async move {
+            crate::bootstrap::initialize(config.clone()).await.unwrap();
+            let daemon = crate::runtime::run(config.clone(), false);
+            tokio::pin!(daemon);
+            tokio::select! {
+                result = &mut daemon => panic!("daemon stopped: {result:?}"),
+                () = checks(config.clone(), name.clone()) => {}
+            }
+        },
+    )
+    .await;
+}
+
+/// A seeded source schema, publication and catalog for `body`, which runs the
+/// daemon itself; everything is removed afterwards.
+async fn with_source<F, Fut>(
+    url: &str,
+    sql: &Client,
+    label: &str,
+    seed: &str,
+    configure: impl FnOnce(&mut Config),
+    body: F,
+) where
+    F: FnOnce(Config, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let name = format!(
         "flow_public_block_{label}_{}",
         SystemTime::now()
@@ -125,7 +157,9 @@ async fn with_seeded_daemon<F, Fut>(
     }
     // Surface capture warnings (disconnects, deferred checks) in test output.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            std::env::var("FLOW_TEST_LOG").unwrap_or_else(|_| "warn".into()),
+        ))
         .with_test_writer()
         .try_init();
     let root = tempfile::tempdir().unwrap();
@@ -171,16 +205,9 @@ async fn with_seeded_daemon<F, Fut>(
         .insert(uri.clone(), catalog);
     assert!(url.starts_with("postgres"));
 
-    let body = AssertUnwindSafe(async {
-        crate::bootstrap::initialize(config.clone()).await.unwrap();
-        let daemon = crate::runtime::run(config.clone(), false);
-        tokio::pin!(daemon);
-        tokio::select! {
-            result = &mut daemon => panic!("daemon stopped: {result:?}"),
-            () = checks(config.clone(), name.clone()) => {}
-        }
-    });
-    let result = body.catch_unwind().await;
+    let result = AssertUnwindSafe(body(config.clone(), name.clone()))
+        .catch_unwind()
+        .await;
 
     // Dropping the daemon closes capture; always release the slot.
     for _ in 0..100 {
@@ -1116,6 +1143,293 @@ async fn live_initial_copy_splits_large_tables_into_page_ranges() {
             }
         },
     )
+    .await;
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
+}
+
+/// Run the daemon, without compaction, until `checks` finish.
+async fn run_until(config: &Config, checks: impl Future<Output = ()>) {
+    run_until_with(config, false, checks).await
+}
+
+async fn run_until_with(config: &Config, compaction: bool, checks: impl Future<Output = ()>) {
+    {
+        let daemon = crate::runtime::run(config.clone(), compaction);
+        tokio::pin!(daemon);
+        tokio::select! {
+            result = &mut daemon => panic!("daemon stopped: {result:?}"),
+            () = checks => {}
+        }
+    }
+    // A stopped daemon's capture thread releases the state lock shortly
+    // after; a process exit releases it at once.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+}
+
+async fn source_values(sql: &Client, name: &str, table: &str) -> Vec<(i64, Option<String>)> {
+    sql.query(
+        &format!("SELECT id, status FROM {name}.{table} ORDER BY id"),
+        &[],
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.get(0), row.get(1)))
+    .collect()
+}
+
+/// A table added to the configuration of a running source is copied under a
+/// temporary snapshot beside capture, without a resync: its target matches
+/// the source exactly, including changes made while it was copied, and the
+/// other table keeps publishing throughout and after restarts.
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL"]
+async fn live_added_table_copies_beside_capture() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let seed = "INSERT INTO {name}.items
+                    SELECT id, repeat('item-', 30) || id FROM generate_series(2, 20000) id;
+                DELETE FROM {name}.items WHERE id % 9 = 0;";
+    with_source(&url, &sql, "add_table", seed, |_| {}, |config, name| {
+        let (sql, url) = (&sql, &url);
+        async move {
+            let mut original = config.clone();
+            original.tables.truncate(1);
+            crate::bootstrap::initialize(original.clone()).await.unwrap();
+            run_until(&original, async {
+                sql.batch_execute(&format!("INSERT INTO {name}.orders VALUES (2, 'before')"))
+                    .await
+                    .unwrap();
+                until("orders publish before the addition", || async {
+                    published_values(&name, "orders").await == source_values(sql, &name, "orders").await
+                })
+                .await;
+            })
+            .await;
+
+            // Add `items` while both tables keep changing.
+            let (writer_sql, writer_connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+            let writer_task = tokio::spawn(writer_connection);
+            let writes = {
+                let name = name.clone();
+                async move {
+                    for step in 0..60i64 {
+                        writer_sql
+                            .batch_execute(&format!(
+                                "BEGIN;
+                                 UPDATE {name}.items SET status = 'moved-{step}' WHERE id % 60 = {step};
+                                 INSERT INTO {name}.items VALUES ({id}, 'added-{step}');
+                                 DELETE FROM {name}.items WHERE id = {gone};
+                                 UPDATE {name}.items SET id = id + 100000 WHERE id = {rekey};
+                                 INSERT INTO {name}.orders VALUES ({order}, 'during-{step}');
+                                 COMMIT",
+                                id = 40_000 + step,
+                                gone = 1_000 + step,
+                                rekey = 2_000 + step,
+                                order = 10 + step,
+                            ))
+                            .await
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                }
+            };
+            run_until_with(&config, true, async {
+                writes.await;
+                until("the added table matches its source", || async {
+                    published_values(&name, "items").await == source_values(sql, &name, "items").await
+                })
+                .await;
+                until("orders kept publishing", || async {
+                    published_values(&name, "orders").await == source_values(sql, &name, "orders").await
+                })
+                .await;
+            })
+            .await;
+            drop(writer_task);
+            assert!(blocked_tables(&config).is_empty(), "{:?}", blocked_tables(&config));
+
+            // The added table is an ordinary table after a restart.
+            run_until_with(&config, true, async {
+                sql.batch_execute(&format!(
+                    "BEGIN; UPDATE {name}.items SET status = 'after-restart' WHERE id % 13 = 0;
+                     DELETE FROM {name}.items WHERE id % 17 = 0;
+                     INSERT INTO {name}.orders VALUES (500, 'after-restart'); COMMIT"
+                ))
+                .await
+                .unwrap();
+                until("both tables match after a restart", || async {
+                    published_values(&name, "items").await == source_values(sql, &name, "items").await
+                        && published_values(&name, "orders").await
+                            == source_values(sql, &name, "orders").await
+                })
+                .await;
+            })
+            .await;
+        }
+    })
+    .await;
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
+}
+
+/// Stopping the daemon at any point of an added table's copy loses nothing:
+/// the next start recovers the publication, publishes a complete staged
+/// copy, or copies again from a new snapshot.
+#[tokio::test]
+#[ignore = "requires FLOW_POSTGRES_URL"]
+async fn live_added_table_copy_survives_interruptions() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let seed = "INSERT INTO {name}.items
+                    SELECT id, repeat('item-', 30) || id FROM generate_series(2, 60000) id;";
+    with_source(&url, &sql, "add_interrupted", seed, |_| {}, |config, name| {
+        let sql = &sql;
+        async move {
+            let mut original = config.clone();
+            original.tables.truncate(1);
+            crate::bootstrap::initialize(original.clone()).await.unwrap();
+            run_until(&original, async {
+                until("orders publish before the addition", || async {
+                    published_values(&name, "orders").await == source_values(sql, &name, "orders").await
+                })
+                .await;
+            })
+            .await;
+            for (attempt, millis) in [60u64, 150, 300, 500, 800, 1200].into_iter().enumerate() {
+                sql.batch_execute(&format!(
+                    "BEGIN; UPDATE {name}.items SET status = 'attempt-{attempt}' WHERE id % 7 = {attempt};
+                     DELETE FROM {name}.items WHERE id % 1000 = {attempt};
+                     INSERT INTO {name}.items VALUES ({id}, 'attempt-{attempt}');
+                     INSERT INTO {name}.orders VALUES ({order}, 'attempt-{attempt}'); COMMIT",
+                    id = 70_000 + attempt,
+                    order = 100 + attempt,
+                ))
+                .await
+                .unwrap();
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(millis),
+                    crate::runtime::run(config.clone(), true),
+                )
+                .await;
+                // Let detached blocking work of the stopped daemon finish.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            run_until_with(&config, true, async {
+                until("the interrupted addition converges", || async {
+                    published_values(&name, "items").await == source_values(sql, &name, "items").await
+                        && published_values(&name, "orders").await
+                            == source_values(sql, &name, "orders").await
+                })
+                .await;
+            })
+            .await;
+        }
+    })
+    .await;
+    drop(sql);
+    sql_task.await.unwrap().unwrap();
+}
+
+/// Measurement, not a check: copy an added table of `FLOW_ADD_TABLE_ROWS`
+/// rows while another table takes a steady stream of commits, and report the
+/// copy's rate and the other table's commit-to-visible lag before, during
+/// and after it.
+#[tokio::test]
+#[ignore = "measurement; requires FLOW_POSTGRES_URL"]
+async fn measure_added_table_copy_beside_capture() {
+    let url = std::env::var("FLOW_POSTGRES_URL").expect("FLOW_POSTGRES_URL");
+    let rows: i64 = std::env::var("FLOW_ADD_TABLE_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(1_000_000);
+    let (sql, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let sql_task = tokio::spawn(connection);
+    let seed = format!(
+        "INSERT INTO {{name}}.items SELECT id, md5(id::text) || repeat('x', 100) FROM generate_series(2, {rows}) id;"
+    );
+    with_source(&url, &sql, "add_measure", &seed, |_| {}, |config, name| {
+        let url = &url;
+        async move {
+            let mut original = config.clone();
+            original.tables.truncate(1);
+            crate::bootstrap::initialize(original.clone()).await.unwrap();
+            run_until(&original, async {
+                until("orders publish", || async { published_rows(&name, "orders").await == 1 }).await;
+            })
+            .await;
+            // A writer commits one order every 20 ms; a prober samples how
+            // far the published count trails it.
+            let (writer, writer_connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+            let writer_task = tokio::spawn(writer_connection);
+            let written = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writing = {
+                let (written, stop, name) = (written.clone(), stop.clone(), name.clone());
+                tokio::spawn(async move {
+                    let mut id = 10i64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        writer
+                            .execute(&format!("INSERT INTO {name}.orders VALUES ({id}, 'steady')"), &[])
+                            .await
+                            .unwrap();
+                        written.lock().unwrap().push(Instant::now());
+                        id += 1;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+            };
+            let started = Instant::now();
+            let mut samples: Vec<(f64, f64, bool)> = Vec::new();
+            let mut copied_at = None;
+            // Compaction runs, as in production: without it, L0 debt pauses
+            // the other table's publication regardless of the copy.
+            run_until_with(&config, true, async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let visible = published_rows(&name, "orders").await.saturating_sub(1);
+                    let lag = {
+                        let written = written.lock().unwrap();
+                        written
+                            .get(visible)
+                            .map_or(0.0, |oldest_unpublished| oldest_unpublished.elapsed().as_secs_f64())
+                    };
+                    let copying = copied_at.is_none();
+                    samples.push((started.elapsed().as_secs_f64(), lag, copying));
+                    // `rows` with the harness's seed row.
+                    if copied_at.is_none() && published_rows(&name, "items").await as i64 == rows {
+                        copied_at = Some(started.elapsed());
+                    }
+                    if copied_at.is_some_and(|at| started.elapsed() > at + Duration::from_secs(10)) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writing.await.unwrap();
+            drop(writer_task);
+            let copied = copied_at.unwrap().as_secs_f64();
+            let percentile = |during: bool, p: f64| {
+                let mut lags: Vec<f64> = samples.iter().filter(|s| s.2 == during).map(|s| s.1).collect();
+                lags.sort_by(f64::total_cmp);
+                lags.get(((lags.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0)
+            };
+            println!(
+                "ADD_TABLE_MEASURE rows={rows} copy_seconds={copied:.1} rows_per_second={:.0} \
+                 other_table_lag_during_copy p50={:.2}s p95={:.2}s max={:.2}s; after p50={:.2}s p95={:.2}s",
+                rows as f64 / copied,
+                percentile(true, 0.5),
+                percentile(true, 0.95),
+                percentile(true, 1.0),
+                percentile(false, 0.5),
+                percentile(false, 0.95),
+            );
+        }
+    })
     .await;
     drop(sql);
     sql_task.await.unwrap().unwrap();

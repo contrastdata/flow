@@ -79,12 +79,12 @@ async fn run_service(
     observation.record_source_health(lifecycle.source_health());
     crate::lifecycle::refuse_if_resync_required(&config)?;
     let mut boot = bootstrap(&control, &config)?;
+    let mut config = config;
+    // The bootstrap's tables first, in its order; added tables follow and are
+    // registered and copied below, beside capture.
+    let recorded = crate::bootstrap::order_tables(&mut config, &boot)?;
     crate::bootstrap::validate_identity(&config, &boot)?;
-    ensure!(
-        boot.schemas.len() == config.tables.len(),
-        crate::exit::config("configured tables changed; explicit resynchronization is required")
-    );
-    for (index, configured) in config.tables.iter().enumerate() {
+    for (index, configured) in config.tables.iter().enumerate().take(recorded) {
         ensure!(
             configured.schema(boot.schemas[index].table_id.0) == boot.schemas[index]
                 && (
@@ -192,6 +192,19 @@ async fn run_service(
             crate::bootstrap::resume(&config, store.clone(), catalog.clone(), &mut boot).await;
         crate::lifecycle::record_publication_changed(&config, resumed)?;
     }
+    if boot.schemas.len() < config.tables.len() {
+        let recorded = boot.schemas.len();
+        crate::bootstrap::register_additions(
+            &config,
+            &store,
+            catalog.as_ref(),
+            &mut boot,
+            recorded,
+        )
+        .await?;
+    }
+    // Added tables publish nothing until their base is copied beside capture.
+    let copying = crate::bootstrap::pending_copies(&store, &boot)?;
     // Recovery may truncate only a torn tail above what the ledger recorded.
     let mut ledger = ledger(&store, &config)?;
     let (journal, recovery) = crate::source::open_source_journal(&config, &ledger)?;
@@ -330,7 +343,15 @@ async fn run_service(
     // Workers and health checks share the immutable admission configuration.
     // Evolving source schemas are read from the durable schema registry.
     let config = Arc::new(config);
+    let copies = TableCopies::start(
+        config.clone(),
+        store.clone(),
+        catalog.clone(),
+        &boot,
+        copying,
+    );
     let publishing = PublishRuntime {
+        copies,
         work: TableWork {
             config: config.clone(),
             store: store.clone(),
@@ -664,7 +685,95 @@ fn remove_scratch(path: PathBuf) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Added tables whose base is being copied beside capture, one table at a
+/// time. They are excluded from all work, so their journaled changes hold the
+/// acknowledgement until the base is published.
+struct TableCopies {
+    pending: HashSet<TableId>,
+    done: tokio::sync::mpsc::UnboundedReceiver<Result<TableId>>,
+    _driver: Option<AbortOnDrop>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl TableCopies {
+    fn start(
+        config: Arc<Config>,
+        store: StateStore,
+        catalog: Arc<dyn iceberg::Catalog>,
+        boot: &crate::bootstrap::Bootstrap,
+        pending: Vec<TableId>,
+    ) -> Self {
+        let (send, done) = tokio::sync::mpsc::unbounded_channel();
+        let tables: Vec<_> = boot
+            .schemas
+            .iter()
+            .zip(&boot.target_uuids)
+            .enumerate()
+            .filter(|(_, (schema, _))| pending.contains(&schema.table_id))
+            .map(|(index, (schema, uuid))| (index, schema.clone(), *uuid))
+            .collect();
+        metrics::gauge!("flow_tables_copying").set(tables.len() as f64);
+        let driver = (!tables.is_empty()).then(|| {
+            AbortOnDrop(tokio::spawn(async move {
+                let mut remaining = tables.len();
+                for (index, schema, uuid) in tables {
+                    let mut attempt = 0u32;
+                    let result = loop {
+                        match crate::bootstrap::copy_addition(
+                            &config,
+                            &store,
+                            catalog.clone(),
+                            index,
+                            &schema,
+                            uuid,
+                        )
+                        .await
+                        {
+                            Ok(cut) => {
+                                tracing::info!(event = "table_copy_completed", table_id = schema.table_id.0, lsn = %cut, "added table base published");
+                                break Ok(schema.table_id);
+                            }
+                            Err(error) if crate::retry::transient(&error) => {
+                                tracing::warn!(event = "table_copy_retry", table_id = schema.table_id.0, attempt, error = %format!("{error:#}"), "added table copy interrupted; retrying");
+                                tokio::time::sleep(crate::retry::delay(attempt).min(Duration::from_secs(60))).await;
+                                attempt = attempt.saturating_add(1);
+                            }
+                            // A copy that cannot succeed would hold the
+                            // acknowledgement, and the source's WAL, forever.
+                            Err(error) => {
+                                break Err(error.context(format!(
+                                    "initial copy of added table {}",
+                                    schema.table_id.0
+                                )));
+                            }
+                        }
+                    };
+                    let failed = result.is_err();
+                    remaining -= 1;
+                    metrics::gauge!("flow_tables_copying").set(remaining as f64);
+                    if send.send(result).is_err() || failed {
+                        return;
+                    }
+                }
+            }))
+        });
+        Self {
+            pending: pending.into_iter().collect(),
+            done,
+            _driver: driver,
+        }
+    }
+}
+
 struct PublishRuntime {
+    copies: TableCopies,
     work: TableWork,
     schemas: BTreeMap<TableId, TableSchema>,
     profiles: BTreeMap<TableId, Priority>,
@@ -727,6 +836,7 @@ impl PublishRuntime {
         observation: &mut crate::observation::Observation,
     ) -> Result<()> {
         let Self {
+            mut copies,
             work,
             schemas,
             profiles,
@@ -737,7 +847,11 @@ impl PublishRuntime {
             .with_external_grace(Duration::from_secs(
                 config.limits.external_mutation_grace_secs,
             ));
-        let mut excluded: HashSet<_> = blocked.ids().collect();
+        let mut excluded: HashSet<_> = blocked
+            .ids()
+            .chain(copies.pending.iter().copied())
+            .collect();
+        observation.set_copying(copies.pending.iter().copied());
         let mut recovering: HashSet<TableId>;
         let mut retrying = HashSet::new();
         let mut pending = PendingWork::with_epoch_limit(config.limits.epoch_max_transactions);
@@ -833,12 +947,13 @@ impl PublishRuntime {
                 .get(store)?
                 .iter()
                 .map(|operation| operation.table_id)
-                .filter(|id| !busy.contains(id))
+                .filter(|id| !busy.contains(id) && !copies.pending.contains(id))
                 .collect();
             excluded = blocked
                 .ids()
                 .filter(|id| !retrying.contains(id))
                 .chain(recovering.iter().copied())
+                .chain(copies.pending.iter().copied())
                 .collect();
             for id in &recovering {
                 pending.defer(*id, &mut scheduler);
@@ -943,6 +1058,18 @@ impl PublishRuntime {
                     tracing::info!("shutdown requested; remaining work is durable in the journal");
                     return Ok(());
                 }
+                copied = copies.done.recv(), if !copies.pending.is_empty() => {
+                    let id = copied
+                        .context("added-table copy stopped before publishing every base")??;
+                    // The base covers the table's journaled changes at or
+                    // before its cut; later ones publish from here on.
+                    ledger.reconcile_table(id)?;
+                    copies.pending.remove(&id);
+                    // The copy retired its own base operation.
+                    applied.invalidate();
+                    observation.set_copying(copies.pending.iter().copied());
+                    ack.send(feedback(ledger))?;
+                }
                 changed = receive.changed() => {
                     let progress = receive.borrow_and_update().clone();
                     if let Some(error) = progress.failure() {
@@ -980,8 +1107,10 @@ impl PublishRuntime {
                     ack.send(feedback(ledger))?;
                 }
                 _ = tokio::task::yield_now(), if !recovering.is_empty() || ledger.has_completed_prefix()? => {
+                    // A copying table's base operation belongs to its copy.
                     if let Some(operation) = applied.get(store)?
-                        .iter().find(|operation| !busy.contains(&operation.table_id)).cloned() {
+                        .iter().find(|operation| !busy.contains(&operation.table_id)
+                            && !copies.pending.contains(&operation.table_id)).cloned() {
                         applied.invalidate();
                         let id = operation.table_id;
                         let transactions = ledger.pending_table_transactions_after(id, PgLsn(0))
@@ -1754,6 +1883,7 @@ impl PublishRuntime {
                 .ids()
                 .filter(|id| !retrying.contains(id))
                 .chain(recovering.iter().copied())
+                .chain(copies.pending.iter().copied())
                 .collect();
             pending.refill(
                 ledger,

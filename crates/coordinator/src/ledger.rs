@@ -296,25 +296,33 @@ impl SourceLedger {
             );
             let table = TableId(u32::from_be_bytes(suffix[..4].try_into()?));
             after = Some(table_entry_key(&self.prefix, table, PgLsn(u64::MAX)));
-            let state = self.store.table_state(&table)?;
-            if state.pending_operation.is_some() {
-                continue;
-            }
-            let mut through = PgLsn(0);
-            loop {
-                let ends = self
-                    .pending_table_transactions_after(table, through)
-                    .take_while(|result| match result {
-                        Ok(transaction) => transaction.end_lsn <= state.materialized_lsn,
-                        Err(_) => true,
-                    })
-                    .take(self.batch_capacity())
-                    .map(|transaction| transaction.map(|transaction| transaction.end_lsn))
-                    .collect::<Result<Vec<_>>>()?;
-                let Some(last) = ends.last() else { break };
-                through = *last;
-                self.table_materialized_batch(&ends, table, state.snapshot_id.unwrap_or(0))?;
-            }
+            self.reconcile_table(table)?;
+        }
+        Ok(())
+    }
+    /// Complete `table`'s pending transactions its index already covers: those
+    /// at or below its materialized position, as after publishing a table's
+    /// base at a snapshot cut. A table with an unfinished operation is left
+    /// to that operation's recovery. Call only while no run owns the table.
+    pub fn reconcile_table(&mut self, table: TableId) -> Result<()> {
+        let state = self.store.table_state(&table)?;
+        if state.pending_operation.is_some() {
+            return Ok(());
+        }
+        let mut through = PgLsn(0);
+        loop {
+            let ends = self
+                .pending_table_transactions_after(table, through)
+                .take_while(|result| match result {
+                    Ok(transaction) => transaction.end_lsn <= state.materialized_lsn,
+                    Err(_) => true,
+                })
+                .take(self.batch_capacity())
+                .map(|transaction| transaction.map(|transaction| transaction.end_lsn))
+                .collect::<Result<Vec<_>>>()?;
+            let Some(last) = ends.last() else { break };
+            through = *last;
+            self.table_materialized_batch(&ends, table, state.snapshot_id.unwrap_or(0))?;
         }
         Ok(())
     }
