@@ -169,11 +169,63 @@ fn is_flow_statistics(location: &str, statistics: &StatisticsFile) -> bool {
         .is_some_and(|name| name.ends_with(".stats") && !name.contains('/'))
 }
 
+/// The statistics and partition statistics files a table's metadata lists.
+#[derive(Debug, Default)]
+pub struct ListedStatistics {
+    pub statistics: Vec<StatisticsFile>,
+    pub partition_paths: Vec<String>,
+}
+
+impl ListedStatistics {
+    fn for_snapshot(&self, snapshot_id: i64) -> Option<&StatisticsFile> {
+        self.statistics
+            .iter()
+            .find(|entry| entry.snapshot_id == snapshot_id)
+    }
+
+    /// Paths of every listed statistics and partition statistics file.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.statistics
+            .iter()
+            .map(|entry| entry.statistics_path.as_str())
+            .chain(self.partition_paths.iter().map(String::as_str))
+    }
+}
+
+/// The statistics files `table`'s metadata lists. Some catalogs, such as
+/// AWS Glue's Iceberg REST endpoint, apply statistics updates but omit them
+/// from the metadata they return; when the returned metadata lists none, the
+/// metadata file the table points to is read instead.
+pub async fn listed_statistics(table: &Table) -> Result<ListedStatistics> {
+    let from = |metadata: &iceberg::spec::TableMetadata| ListedStatistics {
+        statistics: metadata.statistics_iter().cloned().collect(),
+        partition_paths: metadata
+            .partition_statistics_iter()
+            .map(|entry| entry.statistics_path.clone())
+            .collect(),
+    };
+    let metadata = table.metadata();
+    let listed = from(metadata);
+    if !listed.statistics.is_empty() || !listed.partition_paths.is_empty() {
+        return Ok(listed);
+    }
+    let Some(location) = table.metadata_location() else {
+        return Ok(listed);
+    };
+    let file = iceberg::spec::TableMetadata::read_from(table.file_io(), location)
+        .await
+        .context("read table statistics from the metadata file")?;
+    Ok(from(&file))
+}
+
 /// Another writer's statistics on `snapshot_id`, if any.
-fn foreign_statistics(table: &Table, snapshot_id: i64) -> Option<&StatisticsFile> {
-    table
-        .metadata()
-        .statistics_for_snapshot(snapshot_id)
+fn foreign_statistics<'a>(
+    table: &Table,
+    listed: &'a ListedStatistics,
+    snapshot_id: i64,
+) -> Option<&'a StatisticsFile> {
+    listed
+        .for_snapshot(snapshot_id)
         .filter(|entry| !flow_statistics(table, entry))
 }
 
@@ -407,7 +459,8 @@ impl TableMaintenance {
             report.skipped = Some("interval");
             return Ok(());
         }
-        if foreign_statistics(table, head).is_some() {
+        let listed = listed_statistics(table).await?;
+        if foreign_statistics(table, &listed, head).is_some() {
             report.skipped = Some("foreign");
             return Ok(());
         }
@@ -478,12 +531,12 @@ impl TableMaintenance {
     ) -> Result<bool> {
         let snapshot_id = file.snapshot_id;
         let fresh = self.catalog.load_table(table.identifier()).await?;
-        if foreign_statistics(&fresh, snapshot_id).is_some() {
+        let listed = listed_statistics(&fresh).await?;
+        if foreign_statistics(&fresh, &listed, snapshot_id).is_some() {
             return Ok(false);
         }
-        let metadata = fresh.metadata();
         let mut updates = Vec::new();
-        for previous in metadata.statistics_iter() {
+        for previous in &listed.statistics {
             if previous.snapshot_id != snapshot_id && flow_statistics(&fresh, previous) {
                 updates.push(TableUpdate::RemoveStatistics {
                     snapshot_id: previous.snapshot_id,
@@ -563,11 +616,13 @@ impl TableMaintenance {
         let Some(head) = metadata.current_snapshot_id() else {
             return Ok(false);
         };
-        if metadata.statistics_for_snapshot(head).is_some() {
+        let listed = listed_statistics(table).await?;
+        if listed.for_snapshot(head).is_some() {
             return Ok(false);
         }
-        let Some(current) = metadata
-            .statistics_iter()
+        let Some(current) = listed
+            .statistics
+            .iter()
             .filter(|statistics| flow_statistics(table, statistics))
             .max_by_key(|statistics| {
                 metadata

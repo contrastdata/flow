@@ -225,19 +225,25 @@ impl Fixture {
         files
     }
 
-    fn flow_statistics(&self) -> Vec<StatisticsFile> {
-        self.head
-            .metadata()
-            .statistics_iter()
-            .filter(|file| file.statistics_path.contains("/metadata/flow-stats-"))
-            .cloned()
-            .collect()
+    /// Flow's entries, read from the metadata file itself: a catalog may
+    /// omit them from the metadata it returns.
+    async fn flow_statistics(&self) -> Vec<StatisticsFile> {
+        iceberg::spec::TableMetadata::read_from(
+            self.head.file_io(),
+            self.head.metadata_location().unwrap(),
+        )
+        .await
+        .unwrap()
+        .statistics_iter()
+        .filter(|file| file.statistics_path.contains("/metadata/flow-stats-"))
+        .cloned()
+        .collect()
     }
 
     /// The single Flow statistics entry, on the head, and its per-field
     /// estimates from the file and from the metadata.
     async fn published(&self) -> (StatisticsFile, HashMap<i32, f64>) {
-        let entries = self.flow_statistics();
+        let entries = self.flow_statistics().await;
         assert_eq!(entries.len(), 1, "Flow keeps one statistics entry");
         let entry = entries.into_iter().next().unwrap();
         assert_eq!(
@@ -300,7 +306,7 @@ async fn compaction_outputs_publish_the_tables_distinct_counts() {
     assert_eq!(report.skipped, Some("coverage"));
     assert_eq!(report.covered_rows, 0);
     assert_eq!(report.total_rows, 2000);
-    assert!(fixture.flow_statistics().is_empty());
+    assert!(fixture.flow_statistics().await.is_empty());
 
     fixture.compact(&maintenance).await;
     let files = fixture.live_data_files().await;
@@ -634,4 +640,125 @@ async fn statistics_set_concurrently_by_another_writer_are_kept() {
     fixture.refresh().await;
     let entries: Vec<_> = fixture.head.metadata().statistics_iter().cloned().collect();
     assert_eq!(entries, [foreign]);
+}
+
+/// AWS Glue's Iceberg REST endpoint applies statistics updates but omits
+/// statistics from the metadata it returns. Flow reads them from the
+/// metadata file: it still replaces its own entry, moves it to the head,
+/// keeps the current file through garbage collection and leaves another
+/// writer's entry alone.
+#[tokio::test]
+async fn statistics_are_kept_when_the_catalog_omits_them() {
+    let mut fixture = Fixture::new().await;
+    fixture.catalog.strip_statistics_from_responses();
+    let maintenance = fixture.maintenance(true);
+    for batch in 0..3 {
+        fixture
+            .insert(batch * 100..(batch + 1) * 100, |id| format!("v{id}"))
+            .await;
+    }
+    fixture.compact(&maintenance).await;
+    let report = maintenance
+        .refresh_statistics(&fixture.head, fixture.schema.table_id)
+        .await
+        .unwrap();
+    assert!(report.published.is_some(), "{report:?}");
+    fixture.refresh().await;
+    assert_eq!(fixture.head.metadata().statistics_iter().count(), 0);
+    let (first, _) = fixture.published().await;
+
+    // A later publication on a newer head replaces Flow's entry.
+    fixture.insert(300..310, |id| format!("v{id}")).await;
+    fixture.compact(&maintenance).await;
+    maintenance
+        .refresh_statistics(&fixture.head, fixture.schema.table_id)
+        .await
+        .unwrap();
+    fixture.refresh().await;
+    let (second, _) = fixture.published().await;
+    assert_ne!(second.statistics_path, first.statistics_path);
+
+    // Re-anchoring sees the entry the catalog omitted.
+    fixture.insert(310..320, |id| format!("v{id}")).await;
+    assert!(
+        maintenance
+            .reanchor_statistics(&fixture.head, fixture.schema.table_id)
+            .await
+            .unwrap()
+    );
+    fixture.refresh().await;
+    let (moved, _) = fixture.published().await;
+    assert_eq!(moved.statistics_path, second.statistics_path);
+
+    // Garbage collection keeps the file the metadata lists.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    maintenance
+        .expire_history(
+            &fixture.head,
+            fixture.schema.table_id,
+            &HistoryPolicy::window(Duration::from_millis(1)),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+    fixture.refresh().await;
+    let policy = GarbagePolicy {
+        grace: Duration::from_millis(1),
+        metadata_grace: Duration::from_millis(1),
+        ..Default::default()
+    };
+    for _ in 0..4 {
+        loop {
+            let report = maintenance
+                .collect_garbage(
+                    &fixture.head,
+                    fixture.schema.table_id,
+                    &policy,
+                    &GarbageProtection::default(),
+                )
+                .await
+                .unwrap();
+            if !report.continuation_required {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    fixture.refresh().await;
+    let (current, _) = fixture.published().await;
+    assert_eq!(current.statistics_path, second.statistics_path);
+    assert!(std::path::Path::new(&current.statistics_path).exists());
+    assert!(!std::path::Path::new(&first.statistics_path).exists());
+
+    // Another writer's entry on the head still blocks publication.
+    let head = fixture.head.metadata().current_snapshot_id().unwrap();
+    fixture
+        .catalog
+        .update_table(
+            TableCommit::builder()
+                .ident(fixture.head.identifier().clone())
+                .requirements(Vec::new())
+                .updates(vec![TableUpdate::SetStatistics {
+                    statistics: StatisticsFile {
+                        snapshot_id: head,
+                        statistics_path: format!(
+                            "{}/metadata/{head}-analyze.stats",
+                            fixture.head.metadata().location()
+                        ),
+                        file_size_in_bytes: 100,
+                        file_footer_size_in_bytes: 50,
+                        key_metadata: None,
+                        blob_metadata: Vec::new(),
+                    },
+                }])
+                .build(),
+        )
+        .await
+        .unwrap();
+    fixture.refresh().await;
+    let report = maintenance
+        .refresh_statistics(&fixture.head, fixture.schema.table_id)
+        .await
+        .unwrap();
+    assert_eq!(report.skipped, Some("foreign"), "{report:?}");
 }

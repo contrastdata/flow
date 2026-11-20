@@ -44,14 +44,22 @@ struct Statistics {
     ndv: Vec<(String, u64)>,
 }
 
-fn statistics(table: &Table, column: impl Fn(i32) -> String) -> Option<Statistics> {
+fn statistics(
+    table: &Table,
+    listed: &flow_coordinator::ListedStatistics,
+    column: impl Fn(i32) -> String,
+) -> Option<Statistics> {
     let metadata = table.metadata();
     let head = metadata.current_snapshot()?;
     let mut snapshot = Some(head);
     // Readers stop at the first ancestor that is no longer in the metadata.
     let file = loop {
         let current = snapshot?;
-        if let Some(file) = metadata.statistics_for_snapshot(current.snapshot_id()) {
+        if let Some(file) = listed
+            .statistics
+            .iter()
+            .find(|file| file.snapshot_id == current.snapshot_id())
+        {
             break file;
         }
         snapshot = current
@@ -101,7 +109,8 @@ pub(crate) async fn run(config: &Config, only: Option<&str>, json: bool) -> Resu
         let view = SnapshotView::current(&table).await?;
         let layout = flow_coordinator::sort_layout(&table, &view);
         let sort = TableSort::of_table(&configured.schema(0), table.metadata());
-        reports.push(report(name, &table, layout, &sort));
+        let listed = flow_coordinator::listed_statistics(&table).await?;
+        reports.push(report(name, &table, layout, &sort, &listed));
     }
     if let Some(only) = only
         && reports.is_empty()
@@ -118,7 +127,13 @@ pub(crate) async fn run(config: &Config, only: Option<&str>, json: bool) -> Resu
     Ok(())
 }
 
-fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> Report {
+fn report(
+    name: String,
+    table: &Table,
+    layout: SortLayout,
+    sort: &TableSort,
+    listed: &flow_coordinator::ListedStatistics,
+) -> Report {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     let column = |id: i32| {
@@ -211,7 +226,7 @@ fn report(name: String, table: &Table, layout: SortLayout, sort: &TableSort) -> 
             column(overlap.field_id)
         ));
     }
-    let statistics = statistics(table, column);
+    let statistics = statistics(table, listed, column);
     Report {
         table: name,
         format_version: metadata.format_version() as u8,

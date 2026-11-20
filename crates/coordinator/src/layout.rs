@@ -172,7 +172,9 @@ fn overlap(field_id: i32, ranges: Vec<(Datum, Datum, u64)>, without_bounds: usiz
         let after = starts.len()
             - starts.partition_point(|start| compare(start, upper) != Ordering::Greater);
         let before = ends.partition_point(|end| compare(end, lower) == Ordering::Less);
-        let files = ranges.len() - after - before;
+        // Bounds another writer recorded may be inverted or incomparable;
+        // they skew this measure, never underflow it.
+        let files = ranges.len().saturating_sub(after + before);
         let after_rows = total_rows
             - start_sums[start_rows
                 .partition_point(|(start, _)| compare(start, upper) != Ordering::Greater)];
@@ -180,7 +182,7 @@ fn overlap(field_id: i32, ranges: Vec<(Datum, Datum, u64)>, without_bounds: usiz
             end_sums[end_rows.partition_point(|(end, _)| compare(end, lower) == Ordering::Less)];
         let weight = *rows as f64;
         weighted_files += weight * files as f64;
-        weighted_rows += weight * (total_rows - after_rows - before_rows) as f64;
+        weighted_rows += weight * total_rows.saturating_sub(after_rows + before_rows) as f64;
     }
     // The deepest point is where the most ranges have started and not ended.
     let mut max_files = 0;
@@ -192,7 +194,7 @@ fn overlap(field_id: i32, ranges: Vec<(Datum, Datum, u64)>, without_bounds: usiz
             .is_some_and(|end| compare(end, start) == Ordering::Less)
         {
             ends_sorted.next();
-            open -= 1;
+            open = open.saturating_sub(1);
         }
         open += 1;
         max_files = max_files.max(open);
@@ -235,6 +237,22 @@ mod tests {
         assert_eq!(overlap.mean_files, 3.0);
         assert_eq!(overlap.lookup_rows_ratio, 1.0);
         assert_eq!(overlap.files_without_bounds, 2);
+    }
+
+    /// A file whose recorded lower bound exceeds its upper bound, or whose
+    /// bounds do not compare, skews the measure without a panic.
+    #[test]
+    fn inverted_and_incomparable_bounds_do_not_underflow() {
+        let inverted = overlap(1, ranges(&[(10, 0, 10)]), 0);
+        assert_eq!(inverted.max_files, 1);
+        let mixed = vec![
+            (Datum::long(0), Datum::long(9), 10),
+            (Datum::string("a"), Datum::string("z"), 10),
+            (Datum::long(20), Datum::long(5), 10),
+        ];
+        let skewed = overlap(1, mixed, 0);
+        assert!(skewed.mean_files.is_finite());
+        assert!(skewed.lookup_rows_ratio.is_finite());
     }
 
     #[test]

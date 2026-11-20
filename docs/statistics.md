@@ -70,7 +70,9 @@ A file counts toward coverage only when its sidecar holds every selected
 column. After a column is added to `columns`, files sketched before hold
 none of its values, so they count again only once maintenance re-sketches
 them, `backfill_files` per visit; until enough have been, the previous
-statistics stay published.
+statistics stay published. A file written before the column existed, as
+after `ALTER TABLE ... ADD COLUMN`, has only nulls in it and gets an empty
+sketch.
 
 Statistics are advisory. A sketch that fails to write leaves its data file
 unsketched, a failed visit backs off like other maintenance, and neither
@@ -100,6 +102,11 @@ that writer's entry in the metadata its commit replaced, restores it and
 logs `statistics_conflict`. Garbage collection keeps every statistics and
 partition statistics file the table metadata lists, and a sidecar for as long
 as its data file is retained.
+
+Some catalogs, such as AWS Glue's Iceberg REST endpoint, apply statistics
+updates but leave statistics out of the table metadata they return. When the
+returned metadata lists none, Flow reads them from the table's metadata
+file, for publishing, re-anchoring, garbage collection and `layout` alike.
 
 ## Inspecting a table
 

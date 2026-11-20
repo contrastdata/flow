@@ -536,7 +536,13 @@ impl TableMaintenance {
         };
         // Catalog JSON is independent of snapshot expiration. Protect the
         // current pointer and every version the catalog still advertises.
-        // Statistics files are referenced by table metadata, not snapshots.
+        // Statistics files are referenced by table metadata, not snapshots;
+        // read them only for a page that holds one.
+        let statistics = if candidates.iter().any(|path| path.ends_with(".stats")) {
+            super::statistics::listed_statistics(&head).await?
+        } else {
+            super::statistics::ListedStatistics::default()
+        };
         let catalog_json: HashSet<&str> = head
             .metadata_location()
             .into_iter()
@@ -546,16 +552,7 @@ impl TableMaintenance {
                     .iter()
                     .map(|entry| entry.metadata_file.as_str()),
             )
-            .chain(
-                head.metadata()
-                    .statistics_iter()
-                    .map(|statistics| statistics.statistics_path.as_str()),
-            )
-            .chain(
-                head.metadata()
-                    .partition_statistics_iter()
-                    .map(|statistics| statistics.statistics_path.as_str()),
-            )
+            .chain(statistics.paths())
             .collect();
 
         let store = self.store.clone();

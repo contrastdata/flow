@@ -181,6 +181,9 @@ pub struct LostResponseCatalog {
     disconnected: AtomicBool,
     next_rewrite: Mutex<Option<RewriteFilesAction>>,
     next_updates: Mutex<Option<Vec<iceberg::TableUpdate>>>,
+    strip_statistics: AtomicBool,
+    /// Stripped tables by metadata location, so repeated loads compare equal.
+    stripped: Mutex<HashMap<String, Table>>,
 }
 impl LostResponseCatalog {
     pub fn new(inner: MemoryCatalog) -> Self {
@@ -190,7 +193,53 @@ impl LostResponseCatalog {
             disconnected: AtomicBool::new(false),
             next_rewrite: Mutex::new(None),
             next_updates: Mutex::new(None),
+            strip_statistics: AtomicBool::new(false),
+            stripped: Mutex::new(HashMap::new()),
         }
+    }
+    /// Omit statistics from every table this catalog returns while still
+    /// applying statistics updates, as AWS Glue's Iceberg REST endpoint does.
+    pub fn strip_statistics_from_responses(&self) {
+        self.strip_statistics.store(true, Ordering::SeqCst);
+    }
+    fn respond(&self, table: Table) -> Result<Table> {
+        let metadata = table.metadata();
+        if !self.strip_statistics.load(Ordering::SeqCst)
+            || metadata.statistics_iter().next().is_none()
+                && metadata.partition_statistics_iter().next().is_none()
+        {
+            return Ok(table);
+        }
+        let location = table.metadata_location().map(str::to_owned);
+        if let Some(cached) = location
+            .as_ref()
+            .and_then(|location| self.stripped.lock().unwrap().get(location).cloned())
+        {
+            return Ok(cached);
+        }
+        let mut builder = metadata.clone().into_builder(None);
+        for statistics in metadata.statistics_iter() {
+            builder = builder.remove_statistics(statistics.snapshot_id);
+        }
+        for statistics in metadata.partition_statistics_iter() {
+            builder = builder.remove_partition_statistics(statistics.snapshot_id);
+        }
+        let mut stripped = Table::builder()
+            .metadata(builder.build()?.metadata)
+            .identifier(table.identifier().clone())
+            .file_io(table.file_io().clone())
+            .runtime(iceberg::Runtime::try_current()?);
+        if let Some(location) = &location {
+            stripped = stripped.metadata_location(location);
+        }
+        let stripped = stripped.build()?;
+        if let Some(location) = location {
+            self.stripped
+                .lock()
+                .unwrap()
+                .insert(location, stripped.clone());
+        }
+        Ok(stripped)
     }
     /// Commit `updates` as another writer just before the next commit, after
     /// its caller has read the table.
@@ -246,11 +295,13 @@ impl Catalog for LostResponseCatalog {
         self.inner.list_tables(n).await
     }
     async fn create_table(&self, n: &NamespaceIdent, c: TableCreation) -> Result<Table> {
-        self.inner.create_table(n, c).await
+        let table = self.inner.create_table(n, c).await?;
+        self.respond(table)
     }
     async fn load_table(&self, t: &TableIdent) -> Result<Table> {
         self.check_connection()?;
-        self.inner.load_table(t).await
+        let table = self.inner.load_table(t).await?;
+        self.respond(table)
     }
     async fn drop_table(&self, t: &TableIdent) -> Result<()> {
         self.inner.drop_table(t).await
@@ -265,7 +316,8 @@ impl Catalog for LostResponseCatalog {
         self.inner.rename_table(s, d).await
     }
     async fn register_table(&self, t: &TableIdent, m: String) -> Result<Table> {
-        self.inner.register_table(t, m).await
+        let table = self.inner.register_table(t, m).await?;
+        self.respond(table)
     }
     async fn update_table(&self, c: TableCommit) -> Result<Table> {
         self.check_connection()?;
@@ -294,6 +346,6 @@ impl Catalog for LostResponseCatalog {
                 "injected lost catalog response",
             ));
         }
-        Ok(table)
+        self.respond(table)
     }
 }

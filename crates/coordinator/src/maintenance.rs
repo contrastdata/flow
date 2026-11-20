@@ -41,7 +41,7 @@ pub(crate) use demotions::MergeDemotions;
 mod levels;
 mod manifests;
 mod statistics;
-pub use statistics::{StatisticsPolicy, StatisticsReport};
+pub use statistics::{ListedStatistics, StatisticsPolicy, StatisticsReport, listed_statistics};
 mod recovery;
 pub(crate) use levels::file_level;
 pub(crate) use recovery::resolve_maintenance_catalog_operation;

@@ -921,10 +921,7 @@ pub(crate) async fn ensure_table_partition_spec(
     let previous = metadata.default_partition_spec_id();
     let mut updates = Vec::new();
     if fields(metadata.default_partition_spec()) != fields(&desired) {
-        updates.push(TableUpdate::AddSpec {
-            spec: desired.clone().into_unbound(),
-        });
-        updates.push(TableUpdate::SetDefaultSpec { spec_id: -1 });
+        updates.extend(default_spec_updates(metadata, &desired));
     }
     if flow_iceberg_ext::ingest_spec_id(metadata).is_none() && !desired.is_unpartitioned() {
         updates.push(TableUpdate::AddSpec {
@@ -976,6 +973,82 @@ pub(crate) async fn ensure_table_partition_spec(
     Ok(updated)
 }
 
+/// The updates that make `desired` the default spec. A spec the table
+/// already has is set by its ID: Java catalogs reuse an added spec that
+/// matches an existing one and then reject setting the "last added" spec
+/// (-1), as when returning to "none" or to an earlier spec.
+fn default_spec_updates(
+    metadata: &iceberg::spec::TableMetadata,
+    desired: &iceberg::spec::PartitionSpec,
+) -> Vec<TableUpdate> {
+    let fields = |spec: &iceberg::spec::PartitionSpec| {
+        spec.fields()
+            .iter()
+            .map(|field| (field.source_id, field.transform))
+            .collect::<Vec<_>>()
+    };
+    match metadata
+        .partition_specs_iter()
+        .find(|spec| fields(spec) == fields(desired))
+    {
+        Some(spec) => vec![TableUpdate::SetDefaultSpec {
+            spec_id: spec.spec_id(),
+        }],
+        None => vec![
+            TableUpdate::AddSpec {
+                spec: desired.clone().into_unbound(),
+            },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ],
+    }
+}
+
+/// The ID of an order the table already has with exactly `keys`, which is
+/// set by its ID for the same reason as [`default_spec_updates`].
+fn existing_sort_order(
+    metadata: &iceberg::spec::TableMetadata,
+    schema: &TableSchema,
+    keys: &[flow_materializer::SortKey],
+) -> Option<i64> {
+    use iceberg::spec::{NullOrder, SortDirection, Transform};
+    let wanted: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            (
+                schema.columns[key.column].field_id,
+                Transform::Identity,
+                if key.descending {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                },
+                if key.nulls_first {
+                    NullOrder::First
+                } else {
+                    NullOrder::Last
+                },
+            )
+        })
+        .collect();
+    metadata
+        .sort_orders_iter()
+        .find(|order| {
+            order
+                .fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.source_id,
+                        field.transform,
+                        field.direction,
+                        field.null_order,
+                    )
+                })
+                .eq(wanted.iter().copied())
+        })
+        .map(|order| order.order_id)
+}
+
 /// Apply an explicitly configured `sort` to an existing target whose default
 /// order differs. Without `sort`, the table's own order is left alone, so it
 /// can be managed from SQL. A lost response is resolved by reloading the table.
@@ -1000,23 +1073,49 @@ pub(crate) async fn ensure_table_sort_order(
         return Ok(table.clone());
     }
     let previous = table.metadata().default_sort_order().order_id;
-    let transaction = Transaction::new(table);
-    let mut action = transaction.replace_sort_order();
-    for key in &keys {
-        let name = &schema.columns[key.column].name;
-        let nulls = if key.nulls_first {
-            iceberg::spec::NullOrder::First
-        } else {
-            iceberg::spec::NullOrder::Last
-        };
-        action = if key.descending {
-            action.desc(name, nulls)
-        } else {
-            action.asc(name, nulls)
-        };
-    }
+    let existing = existing_sort_order(table.metadata(), schema, &keys);
     flow_coordinator::register_catalog_metadata(store, table, schema.table_id).await?;
-    let updated = match action.apply(transaction)?.commit(catalog).await {
+    let result = match existing {
+        Some(order_id) => {
+            catalog
+                .update_table(
+                    TableCommit::builder()
+                        .ident(table.identifier().clone())
+                        .requirements(vec![
+                            TableRequirement::UuidMatch {
+                                uuid: table.metadata().uuid(),
+                            },
+                            TableRequirement::DefaultSortOrderIdMatch {
+                                default_sort_order_id: previous,
+                            },
+                        ])
+                        .updates(vec![TableUpdate::SetDefaultSortOrder {
+                            sort_order_id: order_id,
+                        }])
+                        .build(),
+                )
+                .await
+        }
+        None => {
+            let transaction = Transaction::new(table);
+            let mut action = transaction.replace_sort_order();
+            for key in &keys {
+                let name = &schema.columns[key.column].name;
+                let nulls = if key.nulls_first {
+                    iceberg::spec::NullOrder::First
+                } else {
+                    iceberg::spec::NullOrder::Last
+                };
+                action = if key.descending {
+                    action.desc(name, nulls)
+                } else {
+                    action.asc(name, nulls)
+                };
+            }
+            action.apply(transaction)?.commit(catalog).await
+        }
+    };
+    let updated = match result {
         Ok(table) => table,
         Err(error) => {
             let refreshed = refresh_table(catalog, table).await?;
@@ -1146,6 +1245,27 @@ mod target_identity_tests {
             .await
             .unwrap();
         assert_eq!(order(&unsorted), flow_materializer::TableSort::Unsorted);
+
+        // Back to an earlier order: set by its ID, never added again, which
+        // Java catalogs reject (they reuse it and then refuse -1).
+        configured.sort = Some(crate::config::SortSetting::PrimaryKey);
+        assert_eq!(
+            existing_sort_order(
+                unsorted.metadata(),
+                &schema,
+                &configured.sort_keys().unwrap()
+            ),
+            Some(spec.order_id)
+        );
+        let orders = unsorted.metadata().sort_orders_iter().count();
+        let restored = ensure_table_sort_order(&store, &catalog, &unsorted, &configured, &schema)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.metadata().default_sort_order().order_id,
+            spec.order_id
+        );
+        assert_eq!(restored.metadata().sort_orders_iter().count(), orders);
     }
 
     /// Targets are created unpartitioned. An explicit `partition` replaces a
@@ -1227,12 +1347,49 @@ mod target_identity_tests {
         assert_eq!(again.metadata_location(), partitioned.metadata_location());
 
         configured.partition = Some(crate::config::PartitionSetting::Unpartitioned);
+        // Earlier specs are set by their IDs, never added again, which Java
+        // catalogs reject (they reuse the spec and then refuse -1).
+        let desired = |configured: &ConfiguredTable, table: &Table| {
+            configured
+                .partition_spec(table.metadata().current_schema())
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            default_spec_updates(again.metadata(), &desired(&configured, &again)),
+            [TableUpdate::SetDefaultSpec { spec_id: 0 }]
+        );
         let unpartitioned =
             ensure_table_partition_spec(&store, &catalog, &again, &configured, &schema)
                 .await
                 .unwrap();
         assert!(fields(&unpartitioned).is_empty());
         assert_eq!(unpartitioned.metadata().default_partition_spec_id(), 0);
+
+        configured.partition = Some(crate::config::PartitionSetting::Fields(vec![
+            "bucket(8, id)".into(),
+            "status".into(),
+        ]));
+        let partitioned_spec = partitioned.metadata().default_partition_spec_id();
+        assert_eq!(
+            default_spec_updates(
+                unpartitioned.metadata(),
+                &desired(&configured, &unpartitioned)
+            ),
+            [TableUpdate::SetDefaultSpec {
+                spec_id: partitioned_spec
+            }]
+        );
+        let specs = unpartitioned.metadata().partition_specs_iter().count();
+        let restored =
+            ensure_table_partition_spec(&store, &catalog, &unpartitioned, &configured, &schema)
+                .await
+                .unwrap();
+        assert_eq!(
+            restored.metadata().default_partition_spec_id(),
+            partitioned_spec
+        );
+        assert_eq!(restored.metadata().partition_specs_iter().count(), specs);
     }
 
     #[test]
