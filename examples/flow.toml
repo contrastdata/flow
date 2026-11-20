@@ -177,6 +177,22 @@ prefetch_file_bytes = 4194304
 # /healthz fails after the running main loop stalls this long; 0 disables.
 # liveness_timeout_secs = 300
 
+# Optional: distinct-value statistics (Theta sketches) of target columns,
+# published as Iceberg statistics files that Trino and Spark plan queries
+# with. Compaction output and the initial copy are sketched; CDC epochs are
+# not. See docs/statistics.md.
+# [statistics]
+# enabled = false
+# "auto" (primary key, then integer, date, timestamp, UUID, decimal and
+# string columns), "none", or column names.
+# columns = "auto"
+# max_columns = 16
+# refresh_interval_secs = 900
+# min_coverage_percent = 80
+# recompute_percent = 10
+# max_sketch_reads = 64
+# backfill_files = 4
+
 # Generate these blocks with `contrast-flow --config flow.toml discover`.
 [[tables]]
 source_namespace = "public"
@@ -201,6 +217,9 @@ append_only = false
 # Files in an earlier spec move as compaction rewrites them ("lazy"), or also
 # by background rewrites within [compaction] partition_convert_bytes_per_hour.
 # partition_convert = "lazy"
+# Columns this table sketches when [statistics] is enabled; absent: its
+# columns setting.
+# statistics = ["status"]
 columns = [
   { field_id = 1, name = "id", data_type = "Int64", nullable = false },
   { field_id = 2, name = "status", data_type = "String", nullable = true },

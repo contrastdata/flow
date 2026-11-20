@@ -180,6 +180,7 @@ pub struct LostResponseCatalog {
     lose_next: AtomicBool,
     disconnected: AtomicBool,
     next_rewrite: Mutex<Option<RewriteFilesAction>>,
+    next_updates: Mutex<Option<Vec<iceberg::TableUpdate>>>,
 }
 impl LostResponseCatalog {
     pub fn new(inner: MemoryCatalog) -> Self {
@@ -188,7 +189,13 @@ impl LostResponseCatalog {
             lose_next: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             next_rewrite: Mutex::new(None),
+            next_updates: Mutex::new(None),
         }
+    }
+    /// Commit `updates` as another writer just before the next commit, after
+    /// its caller has read the table.
+    pub fn commit_before_next_commit(&self, updates: Vec<iceberg::TableUpdate>) {
+        *self.next_updates.lock().unwrap() = Some(updates);
     }
     /// Interleave external maintenance after a caller prepares its catalog CAS.
     pub fn rewrite_before_next_commit(&self, action: RewriteFilesAction) {
@@ -266,6 +273,18 @@ impl Catalog for LostResponseCatalog {
         if let Some(rewrite) = rewrite {
             let head = self.inner.load_table(c.identifier()).await?;
             rewrite.commit(&self.inner, &head).await?;
+        }
+        let updates = self.next_updates.lock().unwrap().take();
+        if let Some(updates) = updates {
+            self.inner
+                .update_table(
+                    TableCommit::builder()
+                        .ident(c.identifier().clone())
+                        .requirements(Vec::new())
+                        .updates(updates)
+                        .build(),
+                )
+                .await?;
         }
         let table = self.inner.update_table(c).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {

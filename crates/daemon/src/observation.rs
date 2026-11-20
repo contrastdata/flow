@@ -525,6 +525,57 @@ pub(crate) fn table_remaps(table: TableId, stats: &flow_state_store::RemapStats)
     metrics::gauge!("flow_index_remap_bytes", "table_id" => table).set(stats.bytes as f64);
 }
 
+/// One statistics visit: what it published or why not, and its work.
+pub(crate) fn table_statistics(
+    id: flow_model::TableId,
+    report: &flow_coordinator::StatisticsReport,
+    elapsed: std::time::Duration,
+) {
+    let table = id.0.to_string();
+    if report.published.is_some() {
+        metrics::counter!("flow_statistics_published_total", "table_id" => table.clone())
+            .increment(1);
+    }
+    metrics::counter!("flow_statistics_sketch_reads_total", "table_id" => table.clone())
+        .increment(report.sketch_reads as u64);
+    metrics::counter!("flow_statistics_backfilled_files_total", "table_id" => table.clone())
+        .increment(report.backfilled as u64);
+    if report.total_rows > 0 {
+        metrics::gauge!("flow_statistics_coverage_ratio", "table_id" => table)
+            .set(report.covered_rows as f64 / report.total_rows as f64);
+    }
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+    if let Some(path) = &report.published {
+        tracing::info!(
+            event = "statistics_published",
+            table_id = id.0,
+            statistics_path = path.as_str(),
+            columns = report.columns,
+            covered_rows = report.covered_rows,
+            total_rows = report.total_rows,
+            sketch_reads = report.sketch_reads,
+            backfilled = report.backfilled,
+            recomputed = report.recomputed,
+            elapsed_ms,
+            "published table statistics"
+        );
+    } else {
+        tracing::debug!(
+            target: "flow_events",
+            event = "statistics_skipped",
+            table_id = id.0,
+            reason = report.skipped.unwrap_or(""),
+            covered_rows = report.covered_rows,
+            total_rows = report.total_rows,
+            sketch_reads = report.sketch_reads,
+            backfilled = report.backfilled,
+            recomputed = report.recomputed,
+            elapsed_ms,
+            "table statistics not published"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

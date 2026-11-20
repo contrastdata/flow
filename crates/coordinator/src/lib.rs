@@ -27,8 +27,8 @@ pub use maintenance::{
     BuildRegistration, BuildScope, CatchUpStats, DeleteRepairCursor, DeleteRewritePolicy,
     ExternalMutation, GarbagePolicy, GarbageProtection, GarbageReport, HistoryPlan, HistoryPolicy,
     Inventory, PreparationWait, PreparedCompaction, ReadyCompaction, RetiringCompactionPreparation,
-    RunningCompaction, RunningCompactionPreparation, TableMaintenance, active_build_protection,
-    discard_abandoned_builds,
+    RunningCompaction, RunningCompactionPreparation, StatisticsPolicy, StatisticsReport,
+    TableMaintenance, active_build_protection, discard_abandoned_builds,
 };
 pub use partitioning::ensure_ingest_spec;
 pub use publication::{

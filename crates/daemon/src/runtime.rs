@@ -229,6 +229,14 @@ async fn run_service(
         }
     })
     .await?;
+    // Tables that sketch distinct values: their compaction output and
+    // initial copy are sketched, and maintenance publishes the statistics.
+    let mut sketches = std::collections::HashMap::new();
+    for (table, schema) in config.tables.iter().zip(&boot.schemas) {
+        if let Some(selection) = table.sketch_selection(&config.statistics, schema)? {
+            sketches.insert(schema.table_id, Arc::new(selection));
+        }
+    }
     let publisher = Arc::new(
         TablePublisher::new(
             store.clone(),
@@ -237,7 +245,8 @@ async fn run_service(
             config.limits.batch_rows,
             config.limits.batch_bytes,
         )?
-        .with_read_limits(config.parquet_read.clone())?,
+        .with_read_limits(config.parquet_read.clone())?
+        .with_sketches(sketches.clone()),
     );
     let maintenance = Arc::new(
         TableMaintenance::new(
@@ -257,7 +266,8 @@ async fn run_service(
                     table.partition_convert == crate::config::PartitionConvert::Background
                 })
                 .map(|(_, schema)| schema.table_id),
-        ),
+        )
+        .with_statistics(config.statistics.policy(), sketches),
     );
     for operation in store.pending_operations()? {
         ensure!(

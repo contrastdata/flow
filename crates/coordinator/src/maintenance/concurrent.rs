@@ -349,6 +349,7 @@ impl TableMaintenance {
         let schema = schema.clone();
         let mut writer = self.writer.clone();
         writer.artifact_tracker = Some(ownership.artifact_tracker());
+        writer.sketch = self.sketch_selection(schema.table_id);
         let limits = self.read_limits.clone();
         let cache = self.cache.clone();
         let cancelled = Arc::new(AtomicBool::new(false));

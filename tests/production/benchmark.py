@@ -255,6 +255,9 @@ snapshot_retention_secs = 3600
         if self.args.collapse_memory_bytes is not None:
             text += f'''collapse_memory_bytes = {self.args.collapse_memory_bytes}
 '''
+        if self.args.statistics:
+            # Only when asked, so the same arguments run engines without it.
+            text += "[statistics]\n"
         extra = "".join(f'  {{ field_id = {4 + index}, name = "{column}", data_type = "{kind}", nullable = false }},\n'
                         for index, (column, _, kind, _) in enumerate(self.extra_columns()))
         for name in self.names:
@@ -274,6 +277,7 @@ append_only = {str(self.args.profile == 'append').lower()}
 '''
         text = override_config(text, "compaction", self.args.compaction)
         text = override_config(text, "limits", self.args.limit)
+        text = override_config(text, "statistics", self.args.statistics)
         if self.args.durability:
             if not self.args.durability_uri:
                 raise ValueError("--durability requires --durability-uri")
@@ -1245,6 +1249,8 @@ def main():
                         help="override a [limits] key with a TOML value; repeatable")
     parser.add_argument("--compaction", action="append", default=[], metavar="KEY=VALUE",
                         help="override a [compaction] key with a TOML value; repeatable")
+    parser.add_argument("--statistics", action="append", default=[], metavar="KEY=VALUE",
+                        help="add a [statistics] section with this key, such as enabled=true; repeatable")
     parser.add_argument("--durability-uri", metavar="URI",
                         help="enable remote durability under URI/<run name>, e.g. s3://bucket/prefix")
     parser.add_argument("--durability", action="append", default=[], metavar="KEY=VALUE",

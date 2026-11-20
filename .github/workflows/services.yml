@@ -366,7 +366,7 @@ jobs:
           uv run tests/production/readers.py \
             --catalog-uri "$FLOW_REST_URL" --s3-endpoint "$FLOW_S3_URL" \
             --network flow-ci_default --artifacts "$RUNNER_TEMP/service-readers" \
-            --native-compaction --keyless-duplicates
+            --native-compaction --keyless-duplicates --statistics
       - name: TRUNCATE and catalog-failure table isolation, then journal quota recovery
         if: matrix.suite == 'isolation'
         run: |

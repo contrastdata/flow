@@ -92,6 +92,8 @@ columns = [
   {{ field_id = 2, name = "amount", data_type = {{ Decimal = {{ precision = 18, scale = 4 }} }}, nullable = true }},
 ]
 '''
+        if self.args.statistics:
+            text += "\n[statistics]\nenabled = true\nrefresh_interval_secs = 1\nmin_coverage_percent = 50\n"
         self.config.write_text(text)
         self.environment["RUST_LOG"] = "info"
         self.trino_container = None
@@ -101,6 +103,7 @@ columns = [
                            partitioned=self.args.partitioned,
                            sql_partition=self.args.sql_partition,
                            keyless_duplicates=self.args.keyless_duplicates,
+                           statistics=self.args.statistics,
                            format_version=self.args.format_version,
                            compaction_age_ms={"soft": 60000, "hard": 300000})
 
@@ -348,6 +351,62 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
         result["default_spec_id"] = after["default-spec-id"]
         return result
 
+    def statistics(self):
+        # "auto" sketches the key, then integer, decimal, string, date,
+        # timestamp and UUID columns; boolean, bytea and double are not.
+        columns = {"id": 0, "tenant": 1, "payload": 2, "amount": 3, "day": 5, "stamp": 6, "token": 7}
+
+        def published():
+            metadata = self.table("orders")["metadata"]
+            files = [entry for entry in metadata.get("statistics", [])
+                     if "/metadata/flow-stats-" in entry["statistics-path"]]
+            return (metadata, files) if files else None
+
+        metadata, files = self.until("Flow published no statistics for orders", published)
+        assert len(files) == 1, f"Flow keeps one statistics entry: {files}"
+        entry = files[0]
+        snapshots = {snapshot["snapshot-id"] for snapshot in metadata["snapshots"]}
+        assert entry["snapshot-id"] in snapshots, "statistics are on an expired snapshot"
+        dump(self.directory / "statistics-metadata.json", metadata)
+
+        def show_stats():
+            output = self.trino_sql(f"SHOW STATS FOR flow.{self.name}.orders").stdout
+            return {row["column_name"]: row for row in map(json.loads, filter(None, output.splitlines()))
+                    if row.get("column_name")}
+
+        # Values of initial-copy files and compaction outputs are covered;
+        # CDC epochs in L0 are not, and deleted values stay until a rebuild.
+        current = self.pg.execute("SELECT * FROM orders").fetchall()
+        result = {}
+        for attempt in ("published", "after-later-commit"):
+            stats = show_stats()
+            (self.directory / f"statistics-{attempt}-trino.json").write_text(json.dumps(stats, indent=2))
+            for column, index in columns.items():
+                initial = {row[index] for row in self.initial_rows if row[index] is not None}
+                live = {row[index] for row in current if row[index] is not None}
+                ndv = stats[column]["distinct_values_count"]
+                assert ndv is not None, f"Trino has no distinct count for {column}"
+                if not self.args.native_compaction:
+                    # Nothing is compacted: exactly the initial copy's values.
+                    assert ndv == len(initial), f"{column}: Trino ndv {ndv}, initial copy {len(initial)}"
+                else:
+                    low, high = min(len(initial), len(live)), len(initial | live)
+                    assert 0.95 * low <= ndv <= 1.05 * high, f"{column}: Trino ndv {ndv} outside [{low}, {high}]"
+                result.setdefault(column, {})[attempt] = ndv
+            for column in ("active", "data", "ratio"):
+                assert stats[column]["distinct_values_count"] is None, f"{column} is not sketched"
+            if attempt == "published":
+                # Readers of a later head find the statistics on its ancestor.
+                barrier = self.transaction(["UPDATE accounts SET amount = amount + 1 WHERE id = 2",
+                                            "UPDATE orders SET payload = 'after-statistics' WHERE id = 200"])
+                self.wait_materialized(barrier)
+        layout = subprocess.run(self.command("layout") + ["--table", f"{self.name}.orders"],
+                                capture_output=True, text=True, env=self.environment, timeout=self.args.timeout)
+        assert layout.returncode == 0, layout.stderr
+        (self.directory / "statistics-layout.txt").write_text(layout.stdout)
+        assert "statistics   Flow" in layout.stdout, layout.stdout
+        return {"ndv": result, "statistics_path": entry["statistics-path"], "snapshot": entry["snapshot-id"]}
+
     def restore_native(self):
         if self.args.native_compaction and getattr(self, "protect_rewrite_inputs", False):
             self.stop()
@@ -431,6 +490,8 @@ s3.aws-secret-key={os.environ['AWS_SECRET_ACCESS_KEY']}
             self.phase("snapshot-wal-handoff", self.handoff)
             self.phase("crud", self.mutations)
             self.phase("crud-independent-readers-and-history", lambda: self.verify("crud"))
+            if self.args.statistics:
+                self.phase("statistics-read-by-trino", self.statistics)
             if self.args.sql_partition:
                 self.phase("partition-spec-from-sql-while-running", self.partition_from_sql)
             if self.args.native_compaction:
@@ -514,6 +575,8 @@ def main():
                         help="partition orders from Spark while the daemon runs, then keep replicating")
     parser.add_argument("--partitioned", action="store_true",
                         help="partition orders by year(day), bucket(4, id) and accounts by bucket(2, id)")
+    parser.add_argument("--statistics", action="store_true",
+                        help="enable [statistics] and check Trino's SHOW STATS against the replicated values")
     parser.add_argument("--keyless-duplicates", action="store_true",
                         help="include an append-only table with duplicate complete rows and retained history")
     args = parser.parse_args()

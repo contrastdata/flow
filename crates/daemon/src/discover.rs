@@ -172,6 +172,7 @@ async fn describe(
         sort: None,
         partition: None,
         partition_convert: Default::default(),
+        statistics: None,
     };
     let mut notes = Vec::new();
     if configured.append_only {
@@ -290,6 +291,7 @@ mod tests {
             sort: None,
             partition: None,
             partition_convert: Default::default(),
+            statistics: None,
         };
         let block = render(&table, &["a note\nspanning lines".into()]).unwrap();
         assert!(block.contains("# a note spanning lines\n"));

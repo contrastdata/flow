@@ -517,6 +517,61 @@ pub(crate) async fn read_input_batches(
     Ok(())
 }
 
+/// Sketch the selected columns of an existing data file, reading only their
+/// column chunks under `limits`. Every physical row counts, including rows
+/// a position delete masks: sketches of distinct values are estimates.
+pub async fn sketch_file(
+    file_io: &FileIO,
+    path: &str,
+    selection: &flow_materializer::SketchSelection,
+    batch_rows: usize,
+    limits: &ReadLimits,
+) -> Result<flow_materializer::statistics::FileSketches> {
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    let mut sketches = flow_materializer::statistics::FileSketches::new(selection);
+    let field_ids: Vec<i32> = selection
+        .columns
+        .iter()
+        .map(|column| column.field_id)
+        .collect();
+    // A plain loop rather than a visitor: the future stays `Send` for the
+    // daemon's table actors.
+    let mut input = ParquetInput::open(
+        file_io,
+        path,
+        Input::Lazy,
+        Some(&field_ids),
+        batch_rows,
+        limits,
+    )
+    .await?;
+    while let Some(batch) = input.next_batch().await? {
+        for (index, field) in batch.schema().fields().iter().enumerate() {
+            let Some(field_id) = field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|id| id.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Some(position) = selection
+                .columns
+                .iter()
+                .position(|column| column.field_id == field_id)
+            else {
+                continue;
+            };
+            flow_materializer::statistics::update_sketch(
+                &mut sketches.sketches[position].1,
+                batch.column(index).as_ref(),
+                &selection.columns[position].data_type,
+            )?;
+        }
+        sketches.rows += batch.num_rows() as u64;
+    }
+    Ok(sketches)
+}
+
 type GroupStream = ParquetRecordBatchStream<BoundedReader<ArrowFileReader>>;
 
 /// One Parquet input read one batch at a time, under the same admission

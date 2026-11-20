@@ -486,17 +486,27 @@ pub(crate) async fn resume(
             "initial target incarnation changed"
         );
     }
-    let publisher = Arc::new(TablePublisher::new(
-        store.clone(),
-        catalog.clone(),
-        WriterConfig {
-            target_file_bytes: usize::try_from(config.compaction.l1_target_bytes)
-                .context("initial target file size exceeds platform limit")?,
-            ..crate::services::compacted_writer_config(config)
-        },
-        config.limits.batch_rows,
-        config.limits.batch_bytes,
-    )?);
+    // The initial copy is sketched as it is written, like compaction output.
+    let mut sketches = HashMap::new();
+    for (table, schema) in config.tables.iter().zip(&boot.schemas) {
+        if let Some(selection) = table.sketch_selection(&config.statistics, schema)? {
+            sketches.insert(schema.table_id, Arc::new(selection));
+        }
+    }
+    let publisher = Arc::new(
+        TablePublisher::new(
+            store.clone(),
+            catalog.clone(),
+            WriterConfig {
+                target_file_bytes: usize::try_from(config.compaction.l1_target_bytes)
+                    .context("initial target file size exceeds platform limit")?,
+                ..crate::services::compacted_writer_config(config)
+            },
+            config.limits.batch_rows,
+            config.limits.batch_bytes,
+        )?
+        .with_sketches(sketches),
+    );
     for operation in store.pending_operations()? {
         ensure!(
             operation.operation.kind == OperationKind::Ingest,

@@ -49,6 +49,7 @@ pub(super) enum MetadataTask {
     Manifests,
     History,
     Garbage,
+    Statistics,
 }
 
 impl MetadataTask {
@@ -57,6 +58,7 @@ impl MetadataTask {
             Self::Manifests => "manifest_rewrite",
             Self::History => "snapshot_expiration",
             Self::Garbage => "garbage_collection",
+            Self::Statistics => "statistics",
         }
     }
 }
@@ -1631,7 +1633,17 @@ impl TableWork {
         Ok(self.manifests_due(id, manifests, MetadataScope::Full)?
             || self.garbage_due(id)?
             || self.remaps_due(id)?
+            || self.statistics_due(id)?
             || self.history_due(table, id, MetadataScope::Full).await?)
+    }
+
+    /// Statistics are advisory: a failing refresh backs off like other
+    /// metadata tasks, and none runs under WAL pressure.
+    fn statistics_due(&self, id: TableId) -> Result<bool> {
+        Ok(self.maintenance.statistics_due(id)
+            && !self
+                .backoff()?
+                .failed_until(id, MetadataTask::Statistics, Instant::now()))
     }
 
     /// Whether the table's lazy index remaps exceed their limits, from sizes
@@ -1751,6 +1763,7 @@ impl TableWork {
         let manifests_due = self.manifests_due(id, manifests, scope)?;
         let history_due = self.history_due(&current, id, scope).await?;
         let garbage_due = scope == MetadataScope::Full && self.garbage_due(id)?;
+        let statistics_due = scope == MetadataScope::Full && self.statistics_due(id)?;
         if manifests_due {
             let result = self
                 .maintenance
@@ -1783,6 +1796,14 @@ impl TableWork {
             }
         }
         if history_due {
+            // Readers find statistics on the queried snapshot's closest
+            // ancestor and stop at an expired one: keep Flow's on the head.
+            // A failure only costs readers the statistics until the next
+            // publication.
+            let result = self.maintenance.reanchor_statistics(&current, id).await;
+            if self.settle(id, MetadataTask::Statistics, result)? == Some(true) {
+                current = self.catalog.load_table(current.identifier()).await?;
+            }
             let checkpoints = self.control.checkpoint_protections()?;
             if !unresolved_initial(id, &checkpoints) {
                 let protected =
@@ -1797,6 +1818,16 @@ impl TableWork {
                 // the cap is reported by `flow_snapshots_over_cap`.
                 self.settle(id, MetadataTask::History, result)?;
                 current = self.catalog.load_table(current.identifier()).await?;
+            }
+        }
+        if statistics_due {
+            let started = Instant::now();
+            let result = self.maintenance.refresh_statistics(&current, id).await;
+            if let Some(report) = self.settle(id, MetadataTask::Statistics, result)? {
+                crate::observation::table_statistics(id, &report, started.elapsed());
+                if report.published.is_some() {
+                    current = self.catalog.load_table(current.identifier()).await?;
+                }
             }
         }
         let mut garbage_pending = false;
