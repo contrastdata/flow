@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::TryStreamExt;
 use iceberg::spec::{
     FormatVersion, ManifestContentType, ManifestList, Operation, Snapshot, Summary,
 };
@@ -9,6 +10,7 @@ use iceberg::{Catalog, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::action::{commit_snapshot, manifest_list_writer, manifest_writer};
+use crate::snapshot::{CacheAdmission, ManifestScan};
 use crate::{
     CommitAttempt, CommitBase, CommitResult, ManifestCache, OPERATION_ID_KEY, conflict,
     find_operation, invalid,
@@ -71,6 +73,15 @@ impl RewriteManifestsAction {
         operation_id: impl Into<String>,
         policy: &ManifestRewritePolicy,
     ) -> Result<Option<Self>> {
+        Self::plan_with_cache(table, operation_id, policy, &ManifestCache::default()).await
+    }
+
+    pub async fn plan_with_cache(
+        table: &Table,
+        operation_id: impl Into<String>,
+        policy: &ManifestRewritePolicy,
+        cache: &ManifestCache,
+    ) -> Result<Option<Self>> {
         policy.validate()?;
         let base = CommitBase::new(table);
         base.validate(table)?;
@@ -85,13 +96,8 @@ impl RewriteManifestsAction {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(None);
         };
-        let manifests: Vec<_> = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?
-            .consume_entries()
-            .into_iter()
-            .collect();
+        let scan = ManifestScan::new(table, snapshot, cache).await?;
+        let manifests = scan.manifests();
         if manifests.len() < policy.min_manifest_count {
             return Ok(None);
         }
@@ -227,10 +233,12 @@ impl RewriteManifestsAction {
             .metadata()
             .current_snapshot()
             .ok_or_else(|| invalid("manifest rewrite needs a snapshot"))?;
-        let manifests = cache.manifest_list(table, snapshot).await?.to_vec();
+        let scan = ManifestScan::new(table, snapshot, cache).await?;
+        let manifests = scan.manifests();
         let by_path: BTreeMap<_, _> = manifests
             .iter()
-            .map(|manifest| (manifest.manifest_path.as_str(), manifest))
+            .enumerate()
+            .map(|(index, manifest)| (manifest.manifest_path.as_str(), index))
             .collect();
         let selected: BTreeSet<_> = self.groups.iter().flatten().map(String::as_str).collect();
         if selected.len() != self.groups.iter().map(Vec::len).sum::<usize>() {
@@ -239,10 +247,26 @@ impl RewriteManifestsAction {
         let mut writers = Vec::with_capacity(self.groups.len());
         let mut entries = 0_u64;
         for (index, group) in self.groups.iter().enumerate() {
-            let first = group
+            let indices = group
+                .iter()
+                .map(|path| {
+                    by_path
+                        .get(path.as_str())
+                        .copied()
+                        .ok_or_else(|| invalid("manifest rewrite input disappeared"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let first = indices
                 .first()
-                .and_then(|path| by_path.get(path.as_str()))
+                .map(|&index| &manifests[index])
                 .ok_or_else(|| invalid("manifest rewrite input disappeared"))?;
+            if indices.iter().any(|&index| {
+                let manifest = &manifests[index];
+                manifest.content != first.content
+                    || manifest.partition_spec_id != first.partition_spec_id
+            }) {
+                return Err(invalid("manifest group mixes content or partition specs"));
+            }
             let mut writer = manifest_writer(
                 table,
                 self.snapshot_id,
@@ -253,16 +277,9 @@ impl RewriteManifestsAction {
                 true,
             )?;
             let mut live_entries = 0_u64;
-            for path in group {
-                let manifest = by_path
-                    .get(path.as_str())
-                    .ok_or_else(|| invalid("manifest rewrite input disappeared"))?;
-                if manifest.content != first.content
-                    || manifest.partition_spec_id != first.partition_spec_id
-                {
-                    return Err(invalid("manifest group mixes content or partition specs"));
-                }
-                let loaded = cache.load(table, manifest).await?;
+            let mut loaded =
+                std::pin::pin!(scan.selected(indices.into_iter(), CacheAdmission::Populate));
+            while let Some((_, loaded)) = loaded.try_next().await? {
                 entries = entries
                     .checked_add(loaded.entries().len() as u64)
                     .ok_or_else(|| invalid("manifest entry count overflow"))?;
@@ -306,8 +323,9 @@ impl RewriteManifestsAction {
         .await?;
         writer.add_manifests(
             manifests
-                .into_iter()
-                .filter(|manifest| !selected.contains(manifest.manifest_path.as_str())),
+                .iter()
+                .filter(|manifest| !selected.contains(manifest.manifest_path.as_str()))
+                .cloned(),
         )?;
         writer.add_manifests(output.into_iter())?;
         writer.close().await

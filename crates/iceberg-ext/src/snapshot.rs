@@ -146,10 +146,11 @@ impl ManifestCache {
             .map_err(|error| iceberg::Error::new(error.kind(), error.message()).with_source(error))
     }
 
-    pub(crate) async fn load(
+    pub(crate) async fn read(
         &self,
         table: &Table,
         manifest: &ManifestFile,
+        admission: CacheAdmission,
     ) -> Result<Arc<Manifest>> {
         let key = (
             table.metadata().uuid(),
@@ -158,32 +159,17 @@ impl ManifestCache {
             manifest.added_snapshot_id,
             manifest.first_row_id,
         );
-        self.entries
-            .try_get_with(key, async {
-                manifest.load_manifest(table.file_io()).await.map(Arc::new)
-            })
-            .await
-            .map_err(|error| iceberg::Error::new(error.kind(), error.message()).with_source(error))
-    }
-
-    /// Reuse a cached manifest, but do not admit one read for background
-    /// history scans. Those reads would evict manifests of the current snapshot
-    /// that publication reuses on every commit.
-    pub(crate) async fn peek_or_read(
-        &self,
-        table: &Table,
-        manifest: &ManifestFile,
-    ) -> Result<Arc<Manifest>> {
-        let key = (
-            table.metadata().uuid(),
-            manifest.manifest_path.clone(),
-            manifest.sequence_number,
-            manifest.added_snapshot_id,
-            manifest.first_row_id,
-        );
-        match self.entries.get(&key).await {
-            Some(cached) => Ok(cached),
-            None => manifest.load_manifest(table.file_io()).await.map(Arc::new),
+        let load = async { manifest.load_manifest(table.file_io()).await.map(Arc::new) };
+        match admission {
+            CacheAdmission::Populate => {
+                self.entries.try_get_with(key, load).await.map_err(|error| {
+                    iceberg::Error::new(error.kind(), error.message()).with_source(error)
+                })
+            }
+            CacheAdmission::ReuseOnly => match self.entries.get(&key).await {
+                Some(cached) => Ok(cached),
+                None => load.await,
+            },
         }
     }
 }
@@ -194,6 +180,55 @@ impl Default for ManifestCache {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CacheAdmission {
+    Populate,
+    /// History scans may reuse hot objects without displacing them.
+    ReuseOnly,
+}
+
+/// Descriptors and reads are bound to the same immutable snapshot list.
+/// Consumers select descriptor indices before any manifest I/O.
+pub(crate) struct ManifestScan<'a> {
+    table: &'a Table,
+    cache: &'a ManifestCache,
+    manifests: Arc<[ManifestFile]>,
+}
+
+impl<'a> ManifestScan<'a> {
+    pub(crate) async fn new(
+        table: &'a Table,
+        snapshot: &SnapshotRef,
+        cache: &'a ManifestCache,
+    ) -> Result<Self> {
+        Ok(Self {
+            table,
+            cache,
+            manifests: cache.manifest_list(table, snapshot).await?,
+        })
+    }
+
+    pub(crate) fn manifests(&self) -> &[ManifestFile] {
+        &self.manifests
+    }
+
+    /// Preserve selection order for reproducible rewrite output. Dropping the
+    /// stream on validation failure cancels outstanding reads.
+    pub(crate) fn selected<'s>(
+        &'s self,
+        indices: impl Iterator<Item = usize> + 's,
+        admission: CacheAdmission,
+    ) -> impl futures::Stream<Item = Result<(&'s ManifestFile, Arc<Manifest>)>> + 's {
+        stream::iter(indices)
+            .map(move |index| async move {
+                let descriptor = &self.manifests[index];
+                let loaded = self.cache.read(self.table, descriptor, admission).await?;
+                Ok((descriptor, loaded))
+            })
+            .buffered(16)
+    }
+}
+
 /// A manifest-backed view of one immutable snapshot. It contains physical files,
 /// not row data. The manifest list is retained so unchanged manifests can be
 /// reused on publication without merging the full table on the hot path.
@@ -201,8 +236,9 @@ impl Default for ManifestCache {
 pub struct SnapshotView {
     pub snapshot_id: Option<i64>,
     pub live_files: BTreeMap<String, ManifestEntryRef>,
-    pub(crate) manifests: Vec<ManifestFile>,
-    pub(crate) entries_by_manifest: BTreeMap<String, Vec<ManifestEntryRef>>,
+    manifests: Arc<[ManifestFile]>,
+    // Kept in manifest-list order by ManifestScan::selected.
+    contents: Vec<Arc<Manifest>>,
     deletes_by_target: HashMap<String, Vec<ManifestEntryRef>>,
     shared_deletes: Vec<ManifestEntryRef>,
 }
@@ -212,9 +248,18 @@ impl SnapshotView {
         self.manifests.len()
     }
 
+    pub(crate) fn manifest_contents(
+        &self,
+    ) -> impl Iterator<Item = (&ManifestFile, &[ManifestEntryRef])> {
+        self.manifests
+            .iter()
+            .zip(&self.contents)
+            .map(|(descriptor, manifest)| (descriptor, manifest.entries()))
+    }
+
     /// Includes deleted entries still carried by the current manifest list.
     pub fn manifest_entries(&self) -> usize {
-        self.entries_by_manifest.values().map(Vec::len).sum()
+        self.contents.iter().map(|m| m.entries().len()).sum()
     }
 
     /// Load a snapshot's manifests with bounded I/O concurrency.
@@ -237,8 +282,8 @@ impl SnapshotView {
             .metadata()
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| invalid(format!("snapshot {snapshot_id} is not retained")))?;
-        let manifests = cache.manifest_list(table, snapshot).await?.to_vec();
-        if let Some(manifest) = manifests.iter().find(|manifest| {
+        let scan = ManifestScan::new(table, snapshot, cache).await?;
+        if let Some(manifest) = scan.manifests().iter().find(|manifest| {
             table
                 .metadata()
                 .partition_spec_by_id(manifest.partition_spec_id)
@@ -249,32 +294,28 @@ impl SnapshotView {
                 manifest.manifest_path, manifest.partition_spec_id
             )));
         }
-        let loaded: Vec<_> = stream::iter(manifests.iter().cloned())
-            .map(|manifest| async move {
-                let entries = cache.load(table, &manifest).await?.entries().to_vec();
-                Ok::<_, iceberg::Error>((manifest.manifest_path, entries))
-            })
-            .buffer_unordered(16)
-            .try_collect()
-            .await?;
         let mut live_files = BTreeMap::new();
-        let mut entries_by_manifest = BTreeMap::new();
-        for (path, entries) in loaded {
-            for entry in entries.iter().filter(|entry| entry.is_alive()) {
-                if live_files
-                    .insert(content_file_id(entry.data_file()), entry.clone())
-                    .is_some()
-                {
-                    return Err(invalid(format!(
-                        "duplicate live file {}",
-                        entry.file_path()
-                    )));
+        let mut contents = Vec::with_capacity(scan.manifests().len());
+        {
+            let mut loaded =
+                std::pin::pin!(scan.selected(0..scan.manifests().len(), CacheAdmission::Populate));
+            while let Some((_, manifest)) = loaded.try_next().await? {
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    if live_files
+                        .insert(content_file_id(entry.data_file()), entry.clone())
+                        .is_some()
+                    {
+                        return Err(invalid(format!(
+                            "duplicate live file {}",
+                            entry.file_path()
+                        )));
+                    }
+                    if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
+                        return Err(invalid("manifest entry lacks inherited sequence numbers"));
+                    }
                 }
-                if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
-                    return Err(invalid("manifest entry lacks inherited sequence numbers"));
-                }
+                contents.push(manifest);
             }
-            entries_by_manifest.insert(path, entries);
         }
         crate::action::validate_live_vectors(live_files.values().map(|entry| entry.data_file()))?;
         let mut deletes_by_target: HashMap<String, Vec<ManifestEntryRef>> = HashMap::new();
@@ -295,8 +336,8 @@ impl SnapshotView {
         Ok(Self {
             snapshot_id: Some(snapshot_id),
             live_files,
-            manifests,
-            entries_by_manifest,
+            manifests: scan.manifests,
+            contents,
             deletes_by_target,
             shared_deletes,
         })

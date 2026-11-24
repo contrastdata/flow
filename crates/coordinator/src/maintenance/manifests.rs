@@ -27,7 +27,9 @@ impl TableMaintenance {
             return Err(ReplanRequired.into());
         }
         let id = OperationId(format!("manifest-rewrite-{}", uuid::Uuid::new_v4()));
-        let Some(action) = RewriteManifestsAction::plan(&head, &id.0, policy).await? else {
+        let Some(action) =
+            RewriteManifestsAction::plan_with_cache(&head, &id.0, policy, &self.cache).await?
+        else {
             return Ok(None);
         };
         let operation = PreparedOperation {

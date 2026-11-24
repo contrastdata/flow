@@ -854,8 +854,24 @@ async fn discarded_data_singletons_leave_budget_for_delete_manifest_merge() {
         .await
         .unwrap()
         .expect("eligible delete pair must retain its budget");
+    // Only delete manifests were selected. Prove the writer can carry an
+    // unselected descriptor forward without opening its object.
+    let untouched = &list
+        .entries()
+        .iter()
+        .find(|m| m.content == ManifestContentType::Data)
+        .unwrap()
+        .manifest_path;
+    let io = table.file_io();
+    let bytes = io.new_input(untouched).unwrap().read().await.unwrap();
+    io.delete(untouched).await.unwrap();
     rewrite
         .write_artifacts(&table, &ManifestCache::default())
+        .await
+        .unwrap();
+    io.new_output(untouched)
+        .unwrap()
+        .write(bytes)
         .await
         .unwrap();
     let result = rewrite.commit(&catalog, &table).await.unwrap();
@@ -922,6 +938,17 @@ async fn manifest_cache_reuses_a_snapshots_manifest_list() {
     let second = SnapshotView::current_with_cache(&table, &cache)
         .await
         .unwrap();
+    assert!(
+        flow_iceberg_ext::RewriteManifestsAction::plan_with_cache(
+            &table,
+            "plan-cached",
+            &flow_iceberg_ext::ManifestRewritePolicy::default(),
+            &cache,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     assert_eq!(second.snapshot_id, first.snapshot_id);
     assert_eq!(
         second.live_files.keys().collect::<Vec<_>>(),
@@ -932,4 +959,51 @@ async fn manifest_cache_reuses_a_snapshots_manifest_list() {
             .await
             .is_err()
     );
+}
+
+/// Time repeated traversal of a fragmented, fixed snapshot. Setup and cache
+/// warmup are excluded. The cardinality checks also cover scans larger than
+/// the in-flight window.
+#[tokio::test]
+#[ignore = "local metadata scan benchmark"]
+async fn benchmark_snapshot_manifest_scan() {
+    use flow_iceberg_ext::ManifestCache;
+    use std::time::Instant;
+
+    let (catalog, mut table) = setup().await;
+    let cache = ManifestCache::default();
+    for group in 0..32 {
+        let files = (0..64)
+            .map(|file| data(&format!("group-{group}-file-{file}")))
+            .collect();
+        table = RowDeltaAction::new(&table, format!("append-{group}"))
+            .with_manifest_cache(cache.clone())
+            .add_data_files(files)
+            .commit(&catalog, &table)
+            .await
+            .unwrap()
+            .table;
+    }
+    for warm in [false, true] {
+        SnapshotView::current_with_cache(&table, &cache)
+            .await
+            .unwrap();
+        let mut elapsed = Vec::new();
+        for _ in 0..11 {
+            let cold = ManifestCache::default();
+            let start = Instant::now();
+            let view = SnapshotView::current_with_cache(&table, if warm { &cache } else { &cold })
+                .await
+                .unwrap();
+            elapsed.push(start.elapsed());
+            assert_eq!(view.manifest_count(), 32);
+            assert_eq!(view.live_files.len(), 2048);
+            assert_eq!(view.manifest_entries(), 2048);
+        }
+        elapsed.sort_unstable();
+        println!(
+            "warm={warm} median_us={}",
+            elapsed[elapsed.len() / 2].as_micros()
+        );
+    }
 }

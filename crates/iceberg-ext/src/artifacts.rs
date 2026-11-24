@@ -196,7 +196,9 @@ pub async fn retained_artifacts(
             ) {
                 continue;
             }
-            let entries = cache.peek_or_read(table, manifest).await?;
+            let entries = cache
+                .read(table, manifest, crate::snapshot::CacheAdmission::ReuseOnly)
+                .await?;
             for entry in entries.entries() {
                 if entry.is_alive() && candidates.contains(entry.file_path()) {
                     protected.insert(entry.file_path().to_owned());
@@ -387,7 +389,9 @@ impl RetainedIndex {
             if !unloaded.is_empty() {
                 let loaded: Vec<(String, Box<[u64]>)> = stream::iter(unloaded)
                     .map(|manifest| async move {
-                        let entries = cache.peek_or_read(table, &manifest).await?;
+                        let entries = cache
+                            .read(table, &manifest, crate::snapshot::CacheAdmission::ReuseOnly)
+                            .await?;
                         let mut live: Vec<_> = entries
                             .entries()
                             .iter()

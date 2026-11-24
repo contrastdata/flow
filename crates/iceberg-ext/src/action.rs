@@ -567,19 +567,21 @@ fn recovered(table: &Table, operation_id: &str, property: &str) -> Option<Commit
 
 /// Validate the resulting snapshot, including independent blobs in shared objects.
 pub(crate) fn validate_live_vectors<'a>(
-    files: impl IntoIterator<Item = &'a DataFile>,
+    files: impl Iterator<Item = &'a DataFile> + Clone,
 ) -> Result<()> {
-    let files: Vec<_> = files.into_iter().collect();
+    let mut vectors = files
+        .clone()
+        .filter(|file| file.file_format() == DataFileFormat::Puffin)
+        .peekable();
+    if vectors.peek().is_none() {
+        return Ok(());
+    }
     let data: HashMap<_, _> = files
-        .iter()
         .filter(|file| file.content_type() == DataContentType::Data)
-        .map(|file| (file.file_path(), *file))
+        .map(|file| (file.file_path(), file))
         .collect();
     let mut targets = BTreeSet::new();
-    for file in files
-        .iter()
-        .filter(|file| file.file_format() == DataFileFormat::Puffin)
-    {
+    for file in vectors {
         let target = file
             .referenced_data_file()
             .ok_or_else(|| invalid("deletion vector lacks referenced data file"))?;
@@ -754,12 +756,11 @@ async fn publish_scoped(
         "{}/metadata/{nonce}",
         metadata.location().trim_end_matches('/')
     );
-    let mut manifests = Vec::with_capacity(view.manifests.len() + 2);
+    let mut manifests = Vec::with_capacity(view.manifest_count() + 2);
     let mut rewritten = Vec::new();
     let mut removed_data = Vec::new();
     let mut removed_deletes = Vec::new();
-    for manifest in &view.manifests {
-        let entries = &view.entries_by_manifest[&manifest.manifest_path];
+    for (manifest, entries) in view.manifest_contents() {
         let live = entries.iter().filter(|entry| entry.is_alive());
         let (mut has_removed, mut has_existing) = (false, false);
         if publication.removed.is_empty() {
