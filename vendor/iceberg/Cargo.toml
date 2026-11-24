@@ -74,6 +74,7 @@ version = "58"
 
 [dependencies.arrow-schema]
 version = "58"
+features = ["canonical_extension_types"]
 
 [dependencies.arrow-select]
 version = "58"

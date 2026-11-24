@@ -57,8 +57,10 @@ that used helpers. Changed files: `src/writer/file_writer/mod.rs`,
 
 The separate UUID schema patch preserves Arrow UUID extension metadata and
 recognizes it when converting Arrow schemas back to Iceberg, including list
-elements, map keys/values and struct children. Changed file:
-`src/arrow/schema.rs`. See `docs/patches/iceberg-uuid.patch`.
+elements, map keys/values and struct children. The packaged Cargo manifest
+enables Arrow’s `canonical_extension_types` for standalone builds. Changed
+files include `src/arrow/schema.rs` and `Cargo.toml`. See
+`docs/patches/iceberg-uuid.patch`.
 
 The v3 patch adds bounded Puffin deletion-vector encoding and reading (including
 LZ4 footers), carries blob descriptors through scan tasks, and scopes shared
